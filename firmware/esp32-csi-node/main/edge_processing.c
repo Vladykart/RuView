@@ -834,12 +834,17 @@ static void edge_task(void *arg)
     while (1) {
         if (ring_pop(&slot)) {
             process_frame(&slot);
-            /* Yield after every frame to feed the Core 1 watchdog.
+            /* Yield after every frame to feed watchdog/idle tasks.
              * process_frame() is CPU-intensive (biquad filters, Welford stats,
              * BPM estimation, multi-person vitals) and can take several ms.
              * Without this yield, edge_dsp at priority 5 starves IDLE1 at
              * priority 0, triggering the task watchdog. See issue #266. */
+#if CONFIG_FREERTOS_NUMBER_OF_CORES <= 1
+            /* Single-core (ESP32-C6): give scheduler extra room for idle/WiFi. */
+            vTaskDelay(pdMS_TO_TICKS(20));
+#else
             vTaskDelay(1);
+#endif
         } else {
             /* No frames available — yield briefly. */
             vTaskDelay(pdMS_TO_TICKS(1));
@@ -960,15 +965,22 @@ esp_err_t edge_processing_init(const edge_config_t *cfg)
         return ESP_OK;
     }
 
-    /* Start DSP task on Core 1. */
+    /* Start DSP task — pin to Core 1 on dual-core chips, use any core on single-core. */
+#if CONFIG_FREERTOS_NUMBER_OF_CORES > 1
+    const BaseType_t dsp_core = 1;
+    const UBaseType_t dsp_priority = 5;
+#else
+    const BaseType_t dsp_core = tskNO_AFFINITY;
+    const UBaseType_t dsp_priority = 1;  /* Below WiFi (23) and display (1) — share time. */
+#endif
     BaseType_t ret = xTaskCreatePinnedToCore(
         edge_task,
         "edge_dsp",
         8192,       /* 8 KB stack — sufficient for DSP pipeline. */
         NULL,
-        5,          /* Priority 5 — above idle, below WiFi. */
+        dsp_priority,
         NULL,
-        1           /* Pin to Core 1. */
+        dsp_core
     );
 
     if (ret != pdPASS) {
@@ -976,6 +988,7 @@ esp_err_t edge_processing_init(const edge_config_t *cfg)
         return ESP_ERR_NO_MEM;
     }
 
-    ESP_LOGI(TAG, "Edge DSP task created on Core 1 (stack=8192, priority=5)");
+    ESP_LOGI(TAG, "Edge DSP task created on Core %d (stack=8192, priority=%u)",
+             (int)dsp_core, (unsigned)dsp_priority);
     return ESP_OK;
 }

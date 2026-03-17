@@ -21,8 +21,13 @@
 #include "display_hal.h"
 #include "display_ui.h"
 
+#if CONFIG_IDF_TARGET_ESP32C6
+#define DISP_H_RES  172
+#define DISP_V_RES  320
+#else
 #define DISP_H_RES  368
 #define DISP_V_RES  448
+#endif
 
 static const char *TAG = "disp_task";
 

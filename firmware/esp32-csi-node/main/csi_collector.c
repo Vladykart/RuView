@@ -251,6 +251,23 @@ void csi_collector_init(void)
 
     ESP_LOGI(TAG, "Promiscuous mode enabled for CSI capture");
 
+#if CONFIG_SOC_WIFI_HE_SUPPORT
+    /* ESP32-C6/C2: WiFi 6 HE-LTF CSI acquisition config. */
+    wifi_csi_config_t csi_config = {
+        .enable = 1,
+        .acquire_csi_legacy = 1,
+        .acquire_csi_ht20 = 1,
+        .acquire_csi_ht40 = 1,
+        .acquire_csi_su = 1,
+        .acquire_csi_mu = 1,
+        .acquire_csi_dcm = 1,
+        .acquire_csi_beamformed = 1,
+        .acquire_csi_he_stbc = ESP_CSI_ACQUIRE_STBC_HELTF1,
+        .val_scale_cfg = 0,
+        .dump_ack_en = 0,
+    };
+#else
+    /* ESP32/ESP32-S3: Legacy LTF CSI config. */
     wifi_csi_config_t csi_config = {
         .lltf_en = true,
         .htltf_en = true,
@@ -260,6 +277,7 @@ void csi_collector_init(void)
         .manu_scale = false,
         .shift = false,
     };
+#endif
 
     ESP_ERROR_CHECK(esp_wifi_set_csi_config(&csi_config));
     ESP_ERROR_CHECK(esp_wifi_set_csi_rx_cb(wifi_csi_callback, NULL));

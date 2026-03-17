@@ -138,6 +138,14 @@ void app_main(void)
 
     ESP_LOGI(TAG, "ESP32-S3 CSI Node (ADR-018) — Node ID: %d", g_nvs_config.node_id);
 
+    /* ADR-045: Start display early so the screen lights up during WiFi connect. */
+#ifdef CONFIG_DISPLAY_ENABLE
+    esp_err_t disp_ret = display_task_start();
+    if (disp_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Display init returned: %s", esp_err_to_name(disp_ret));
+    }
+#endif
+
     /* Initialize WiFi STA (skip entirely under QEMU mock — no RF hardware) */
 #ifndef CONFIG_CSI_MOCK_SKIP_WIFI_CONNECT
     wifi_init_sta();
@@ -242,14 +250,6 @@ void app_main(void)
 
     /* Initialize power management. */
     power_mgmt_init(g_nvs_config.power_duty);
-
-    /* ADR-045: Start AMOLED display task (gracefully skips if no display). */
-#ifdef CONFIG_DISPLAY_ENABLE
-    esp_err_t disp_ret = display_task_start();
-    if (disp_ret != ESP_OK) {
-        ESP_LOGW(TAG, "Display init returned: %s", esp_err_to_name(disp_ret));
-    }
-#endif
 
     ESP_LOGI(TAG, "CSI streaming active → %s:%d (edge_tier=%u, OTA=%s, WASM=%s, mmWave=%s)",
              g_nvs_config.target_ip, g_nvs_config.target_port,

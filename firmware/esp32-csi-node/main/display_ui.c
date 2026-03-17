@@ -34,6 +34,15 @@ static const char *TAG = "disp_ui";
 #define COLOR_TEXT       lv_color_make(0xCC, 0xCC, 0xDD)
 #define COLOR_TEXT_DIM   lv_color_make(0x66, 0x66, 0x77)
 
+/* ---- Screen resolution for layout scaling ---- */
+#if CONFIG_IDF_TARGET_ESP32C6
+#define SCR_W  172
+#define SCR_H  320
+#else
+#define SCR_W  368
+#define SCR_H  448
+#endif
+
 /* ---- Chart data points ---- */
 #define CHART_POINTS    60
 
@@ -115,10 +124,10 @@ static void create_dashboard(lv_obj_t *tile)
 {
     make_label(tile, "CSI Dashboard", &s_style_label);
 
-    /* CSI amplitude chart */
+    /* CSI amplitude chart — scale to screen */
     s_dash_chart = lv_chart_create(tile);
-    lv_obj_set_size(s_dash_chart, 400, 130);
-    lv_obj_align(s_dash_chart, LV_ALIGN_TOP_LEFT, 0, 24);
+    lv_obj_set_size(s_dash_chart, SCR_W - 8, (SCR_H < 340) ? 100 : 130);
+    lv_obj_align(s_dash_chart, LV_ALIGN_TOP_LEFT, 0, 20);
     lv_chart_set_type(s_dash_chart, LV_CHART_TYPE_LINE);
     lv_chart_set_point_count(s_dash_chart, CHART_POINTS);
     lv_chart_set_range(s_dash_chart, LV_CHART_AXIS_PRIMARY_Y, 0, 100);
@@ -128,22 +137,15 @@ static void create_dashboard(lv_obj_t *tile)
 
     s_csi_series = lv_chart_add_series(s_dash_chart, COLOR_CYAN, LV_CHART_AXIS_PRIMARY_Y);
 
-    /* Stats panel on the right */
-    lv_obj_t *panel = lv_obj_create(tile);
-    lv_obj_set_size(panel, 120, 130);
-    lv_obj_align(panel, LV_ALIGN_TOP_RIGHT, 0, 24);
-    lv_obj_set_style_bg_color(panel, lv_color_make(0x12, 0x12, 0x1A), 0);
-    lv_obj_set_style_border_width(panel, 1, 0);
-    lv_obj_set_style_border_color(panel, COLOR_DIM, 0);
-    lv_obj_set_style_pad_all(panel, 8, 0);
-    lv_obj_set_flex_flow(panel, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(panel, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    /* Stats below chart on small screens, right panel on large */
+    s_dash_persons = make_label(tile, "Persons: 0", &s_style_label_big);
+    lv_obj_align(s_dash_persons, LV_ALIGN_BOTTOM_LEFT, 4, -50);
 
-    make_label(panel, "Persons", &s_style_label);
-    s_dash_persons = make_label(panel, "0", &s_style_label_big);
+    s_dash_rssi = make_label(tile, "RSSI: --", &s_style_label);
+    lv_obj_align(s_dash_rssi, LV_ALIGN_BOTTOM_LEFT, 4, -30);
 
-    s_dash_rssi = make_label(panel, "RSSI: --", &s_style_label);
-    s_dash_motion = make_label(panel, "Motion: 0.0", &s_style_label);
+    s_dash_motion = make_label(tile, "Motion: 0.0", &s_style_label);
+    lv_obj_align(s_dash_motion, LV_ALIGN_BOTTOM_LEFT, 4, -10);
 }
 
 /* ---- View 1: Vitals ---- */
@@ -152,8 +154,8 @@ static void create_vitals(lv_obj_t *tile)
     make_label(tile, "Vital Signs", &s_style_label);
 
     s_vital_chart = lv_chart_create(tile);
-    lv_obj_set_size(s_vital_chart, 480, 150);
-    lv_obj_align(s_vital_chart, LV_ALIGN_TOP_LEFT, 0, 24);
+    lv_obj_set_size(s_vital_chart, SCR_W - 8, (SCR_H < 340) ? 120 : 150);
+    lv_obj_align(s_vital_chart, LV_ALIGN_TOP_LEFT, 0, 20);
     lv_chart_set_type(s_vital_chart, LV_CHART_TYPE_LINE);
     lv_chart_set_point_count(s_vital_chart, CHART_POINTS);
     lv_chart_set_range(s_vital_chart, LV_CHART_AXIS_PRIMARY_Y, 0, 120);
@@ -181,10 +183,10 @@ static void create_presence(lv_obj_t *tile)
 {
     make_label(tile, "Occupancy Map", &s_style_label);
 
-    int cell_w = 50;
-    int cell_h = 45;
-    int x_off  = (368 - GRID_COLS * (cell_w + 4)) / 2;
-    int y_off  = 30;
+    int cell_w = (SCR_W < 200) ? 32 : 50;
+    int cell_h = (SCR_H < 340) ? 30 : 45;
+    int x_off  = (SCR_W - GRID_COLS * (cell_w + 4)) / 2;
+    int y_off  = 26;
 
     for (int r = 0; r < GRID_ROWS; r++) {
         for (int c = 0; c < GRID_COLS; c++) {
@@ -210,8 +212,8 @@ static void create_system(lv_obj_t *tile)
     make_label(tile, "System Info", &s_style_label);
 
     lv_obj_t *panel = lv_obj_create(tile);
-    lv_obj_set_size(panel, 500, 180);
-    lv_obj_align(panel, LV_ALIGN_TOP_LEFT, 0, 24);
+    lv_obj_set_size(panel, SCR_W - 8, (SCR_H < 340) ? 250 : 180);
+    lv_obj_align(panel, LV_ALIGN_TOP_LEFT, 0, 20);
     lv_obj_set_style_bg_color(panel, lv_color_make(0x12, 0x12, 0x1A), 0);
     lv_obj_set_style_border_width(panel, 1, 0);
     lv_obj_set_style_border_color(panel, COLOR_DIM, 0);
@@ -285,8 +287,8 @@ void display_ui_update(void)
     }
 
     if (s_dash_persons) {
-        char buf[8];
-        snprintf(buf, sizeof(buf), "%u", has_vitals ? vitals.n_persons : 0);
+        char buf[16];
+        snprintf(buf, sizeof(buf), "Persons: %u", has_vitals ? vitals.n_persons : 0);
         lv_label_set_text(s_dash_persons, buf);
     }
 

@@ -12,10 +12,16 @@ if(CONFIG_CSI_MOCK_ENABLED)
     list(APPEND SRCS "mock_csi.c")
 endif()
 
-# ADR-045: AMOLED display support (compile-time optional)
+# ADR-045: Display support (compile-time optional)
+# S3: SH8601 AMOLED + FT3168 touch (needs esp_lcd_touch)
+# C6: ST7789 SPI TFT (no touch component needed)
 if(CONFIG_DISPLAY_ENABLE)
     list(APPEND SRCS "display_hal.c" "display_ui.c" "display_task.c")
-    set(REQUIRES esp_lcd esp_lcd_touch lvgl)
+    if(CONFIG_IDF_TARGET_ESP32C6)
+        set(REQUIRES esp_lcd lvgl driver)
+    else()
+        set(REQUIRES esp_lcd esp_lcd_touch lvgl)
+    endif()
 endif()
 
 idf_component_register(

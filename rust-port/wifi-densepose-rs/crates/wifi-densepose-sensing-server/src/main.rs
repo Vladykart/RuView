@@ -155,8 +155,8 @@ struct Esp32Frame {
     magic: u32,
     node_id: u8,
     n_antennas: u8,
-    n_subcarriers: u8,
-    freq_mhz: u16,
+    n_subcarriers: u16,
+    freq_mhz: u32,
     sequence: u32,
     rssi: i8,
     noise_floor: i8,
@@ -485,13 +485,14 @@ fn parse_esp32_frame(buf: &[u8]) -> Option<Esp32Frame> {
         return None;
     }
 
+    // ADR-018 header: offsets must match csi_serialize_frame() in firmware
     let node_id = buf[4];
     let n_antennas = buf[5];
-    let n_subcarriers = buf[6];
-    let freq_mhz = u16::from_le_bytes([buf[8], buf[9]]);
-    let sequence = u32::from_le_bytes([buf[10], buf[11], buf[12], buf[13]]);
-    let rssi = buf[14] as i8;
-    let noise_floor = buf[15] as i8;
+    let n_subcarriers = u16::from_le_bytes([buf[6], buf[7]]);
+    let freq_mhz = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+    let sequence = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+    let rssi = buf[16] as i8;
+    let noise_floor = buf[17] as i8;
 
     let iq_start = 20;
     let n_pairs = n_antennas as usize * n_subcarriers as usize;
@@ -1180,7 +1181,7 @@ async fn windows_wifi_task(state: SharedState, tick_ms: u64) {
             magic: 0xC511_0001,
             node_id: 0,
             n_antennas: 1,
-            n_subcarriers: obs_count.min(255) as u8,
+            n_subcarriers: obs_count as u16,
             freq_mhz: 2437,
             sequence: seq,
             rssi: first_rssi.clamp(-128.0, 127.0) as i8,
@@ -1333,8 +1334,8 @@ async fn windows_wifi_fallback_tick(state: &SharedState, seq: u32) {
         magic: 0xC511_0001,
         node_id: 0,
         n_antennas: 1,
-        n_subcarriers: 1,
-        freq_mhz: 2437,
+        n_subcarriers: 1_u16,
+        freq_mhz: 2437_u32,
         sequence: seq,
         rssi: rssi_dbm as i8,
         noise_floor: -90,
@@ -1443,6 +1444,254 @@ async fn probe_windows_wifi() -> bool {
     }
 }
 
+// ── Linux WiFi RSSI collector ────────────────────────────────────────────────
+
+/// Probe if Linux WiFi is available by reading /proc/net/wireless.
+async fn probe_linux_wifi() -> bool {
+    match tokio::fs::read_to_string("/proc/net/wireless").await {
+        Ok(content) => {
+            // /proc/net/wireless has 2 header lines, then one line per interface.
+            content.lines().skip(2).any(|line| !line.trim().is_empty())
+        }
+        Err(_) => false,
+    }
+}
+
+/// Parse /proc/net/wireless to extract (interface, rssi_dbm, link_quality, noise_dbm).
+fn parse_proc_net_wireless(content: &str) -> Option<(String, f64, f64, f64)> {
+    // Format:
+    // Inter-| sta-|   Quality        |   Discarded packets               | Missed | WE
+    //  face | tus | link level noise |  nwid  crypt   frag  retry   misc | beacon | 22
+    // wlp43s0: 0000   70.  -40.  -256     0      0      0    112    236        0
+    for line in content.lines().skip(2) {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Split on ':' to get interface name
+        let mut parts = line.splitn(2, ':');
+        let iface = parts.next()?.trim().to_string();
+        let rest = parts.next()?.trim();
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        if fields.len() < 3 {
+            continue;
+        }
+        // fields[0] = status, fields[1] = link quality, fields[2] = level (dBm), fields[3] = noise
+        let link = fields[1].trim_end_matches('.').parse::<f64>().unwrap_or(0.0);
+        let level = fields[2].trim_end_matches('.').parse::<f64>().unwrap_or(-90.0);
+        let noise = if fields.len() > 3 {
+            fields[3].trim_end_matches('.').parse::<f64>().unwrap_or(-256.0)
+        } else {
+            -256.0
+        };
+        return Some((iface, level, link, noise));
+    }
+    None
+}
+
+/// Get the SSID of the connected WiFi interface on Linux.
+async fn get_linux_ssid(iface: &str) -> String {
+    // Try `iw dev <iface> link` first — works without root.
+    match tokio::process::Command::new("iw")
+        .args(["dev", iface, "link"])
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => {
+            let out = String::from_utf8_lossy(&o.stdout);
+            for line in out.lines() {
+                let trimmed = line.trim();
+                if let Some(rest) = trimmed.strip_prefix("SSID:") {
+                    return rest.trim().to_string();
+                }
+            }
+        }
+        _ => {}
+    }
+    // Fallback: try iwgetid
+    match tokio::process::Command::new("iwgetid")
+        .args(["-r", iface])
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => {
+            let ssid = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if !ssid.is_empty() {
+                return ssid;
+            }
+        }
+        _ => {}
+    }
+    "Unknown".to_string()
+}
+
+/// Linux WiFi sensing task: reads RSSI from /proc/net/wireless at each tick.
+async fn linux_wifi_task(state: SharedState, tick_ms: u64) {
+    let mut interval = tokio::time::interval(Duration::from_millis(tick_ms));
+    let mut seq: u32 = 0;
+    let mut cached_ssid = String::new();
+    let mut ssid_tick: u64 = 0;
+
+    info!("Linux WiFi sensing active (tick={}ms, source=/proc/net/wireless)", tick_ms);
+
+    loop {
+        interval.tick().await;
+        seq += 1;
+
+        // Read /proc/net/wireless for real-time RSSI
+        let content = match tokio::fs::read_to_string("/proc/net/wireless").await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("Failed to read /proc/net/wireless: {e}");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+
+        let (iface, rssi_dbm, link_quality, noise_dbm) = match parse_proc_net_wireless(&content) {
+            Some(v) => v,
+            None => {
+                debug!("No WiFi interface in /proc/net/wireless");
+                continue;
+            }
+        };
+
+        // Refresh SSID every ~10 seconds (not every tick, to avoid process spawns)
+        if ssid_tick == 0 || seq % (10_000 / tick_ms.max(1) as u32) == 0 {
+            cached_ssid = get_linux_ssid(&iface).await;
+            ssid_tick = seq as u64;
+        }
+
+        // Synthesize a pseudo-CSI frame from RSSI + link quality.
+        // We create multiple "subcarriers" by adding small deterministic variations
+        // around the base signal, simulating what real CSI subcarriers would look like.
+        let n_sub = 56_usize;
+        let base_amp = ((rssi_dbm + 100.0) * 1.5).clamp(1.0, 100.0);
+        let mut amplitudes = Vec::with_capacity(n_sub);
+        let mut phases = Vec::with_capacity(n_sub);
+        for i in 0..n_sub {
+            // Deterministic per-subcarrier variation seeded by seq + subcarrier index
+            let seed = (seq as f64 * 0.37 + i as f64 * 1.618).sin();
+            let noise_factor = seed * (link_quality / 70.0).clamp(0.1, 1.0) * 3.0;
+            amplitudes.push((base_amp + noise_factor).max(0.1));
+            phases.push((i as f64 * 0.2 + seq as f64 * 0.05).sin() * std::f64::consts::PI);
+        }
+
+        let frame = Esp32Frame {
+            magic: 0xC511_0001,
+            node_id: 0,
+            n_antennas: 1,
+            n_subcarriers: n_sub as u16,
+            freq_mhz: 2437, // Will be overwritten if we can detect it
+            sequence: seq,
+            rssi: rssi_dbm.clamp(-128.0, 127.0) as i8,
+            noise_floor: noise_dbm.clamp(-128.0, 127.0) as i8,
+            amplitudes,
+            phases,
+        };
+
+        // Update frame history and extract features
+        let mut s = state.write().await;
+        s.frame_history.push_back(frame.amplitudes.clone());
+        if s.frame_history.len() > FRAME_HISTORY_CAPACITY {
+            s.frame_history.pop_front();
+        }
+        let sample_rate_hz = 1000.0 / tick_ms as f64;
+        let (features, mut classification, breathing_rate_hz, sub_variances, raw_motion) =
+            extract_features_from_frame(&frame, &s.frame_history, sample_rate_hz);
+        smooth_and_classify(&mut s, &mut classification, raw_motion);
+        adaptive_override(&s, &features, &mut classification);
+
+        let ssid = &cached_ssid;
+        s.source = format!("wifi:{ssid}");
+        s.rssi_history.push_back(rssi_dbm);
+        if s.rssi_history.len() > 60 {
+            s.rssi_history.pop_front();
+        }
+
+        s.tick += 1;
+        let tick = s.tick;
+
+        let motion_score = if classification.motion_level == "active" {
+            0.8
+        } else if classification.motion_level == "present_still" {
+            0.3
+        } else {
+            0.05
+        };
+
+        let raw_vitals = s.vital_detector.process_frame(&frame.amplitudes, &frame.phases);
+        let vitals = smooth_vitals(&mut s, &raw_vitals);
+        s.latest_vitals = vitals.clone();
+
+        let feat_variance = features.variance;
+
+        // Multi-person estimation with temporal smoothing.
+        let raw_score = compute_person_score(&features);
+        s.smoothed_person_score = s.smoothed_person_score * 0.85 + raw_score * 0.15;
+        let est_persons = if classification.presence {
+            score_to_person_count(s.smoothed_person_score)
+        } else {
+            0
+        };
+
+        let mut update = SensingUpdate {
+            msg_type: "sensing_update".to_string(),
+            timestamp: chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
+            source: format!("wifi:{ssid}"),
+            tick,
+            nodes: vec![NodeInfo {
+                node_id: 0,
+                rssi_dbm,
+                position: [0.0, 0.0, 0.0],
+                amplitude: frame.amplitudes.clone(),
+                subcarrier_count: n_sub,
+            }],
+            features,
+            classification,
+            signal_field: generate_signal_field(
+                rssi_dbm, motion_score, breathing_rate_hz,
+                feat_variance.min(1.0), &sub_variances,
+            ),
+            vital_signs: Some(vitals),
+            enhanced_motion: None,
+            enhanced_breathing: None,
+            posture: None,
+            signal_quality_score: None,
+            quality_verdict: None,
+            bssid_count: None,
+            pose_keypoints: None,
+            model_status: if s.model_loaded {
+                Some(serde_json::json!({
+                    "loaded": true,
+                    "sona_profile": s.active_sona_profile.as_deref().unwrap_or("default"),
+                }))
+            } else {
+                None
+            },
+            persons: None,
+            estimated_persons: if est_persons > 0 { Some(est_persons) } else { None },
+        };
+
+        let persons = derive_pose_from_sensing(&update);
+        if !persons.is_empty() {
+            update.persons = Some(persons);
+        }
+
+        if update.classification.presence {
+            s.total_detections += 1;
+        }
+        if let Ok(json) = serde_json::to_string(&update) {
+            let _ = s.tx.send(json);
+        }
+        s.latest_update = Some(update);
+
+        if tick % 100 == 0 {
+            debug!("Linux WiFi tick #{tick}: iface={iface}, RSSI={rssi_dbm:.0} dBm, SSID={ssid}");
+        }
+    }
+}
+
 /// Probe if ESP32 is streaming on UDP port
 async fn probe_esp32(port: u16) -> bool {
     let addr = format!("0.0.0.0:{port}");
@@ -1477,7 +1726,7 @@ fn generate_simulated_frame(tick: u64) -> Esp32Frame {
         magic: 0xC511_0001,
         node_id: 1,
         n_antennas: 1,
-        n_subcarriers: n_sub as u8,
+        n_subcarriers: n_sub as u16,
         freq_mhz: 2437,
         sequence: tick as u32,
         rssi: (-40.0 + 5.0 * (t * 0.2).sin()) as i8,
@@ -3465,6 +3714,9 @@ async fn main() {
             if probe_esp32(args.udp_port).await {
                 info!("  ESP32 CSI detected on UDP :{}", args.udp_port);
                 "esp32"
+            } else if probe_linux_wifi().await {
+                info!("  Linux WiFi detected");
+                "linux_wifi"
             } else if probe_windows_wifi().await {
                 info!("  Windows WiFi detected");
                 "wifi"
@@ -3618,6 +3870,9 @@ async fn main() {
         }
         "wifi" => {
             tokio::spawn(windows_wifi_task(state.clone(), args.tick_ms));
+        }
+        "linux_wifi" => {
+            tokio::spawn(linux_wifi_task(state.clone(), args.tick_ms));
         }
         _ => {
             tokio::spawn(simulated_data_task(state.clone(), args.tick_ms));

@@ -83,7 +83,19 @@ def generate_nvs_binary(csv_content, size):
         # Try the pip-installed version first (esp_idf_nvs_partition_gen package)
         try:
             from esp_idf_nvs_partition_gen import nvs_partition_gen
-            nvs_partition_gen.generate(csv_path, bin_path, size)
+            # Newer versions expect an argparse-like object with attributes.
+            class _NvsArgs:
+                def __init__(self, inp, output, sz):
+                    self.input = inp
+                    self.output = output
+                    self.size = hex(sz) if isinstance(sz, int) else sz
+                    self.version = 2
+                    self.outdir = os.path.dirname(output) or "."
+                    self.key_protect_hmac = False
+                    self.kp_hmac_keygen = False
+                    self.kp_hmac_keyfile = None
+                    self.kp_hmac_inputkey = None
+            nvs_partition_gen.generate(_NvsArgs(csv_path, bin_path, size))
             with open(bin_path, "rb") as f:
                 return f.read()
         except ImportError:
@@ -124,7 +136,7 @@ def generate_nvs_binary(csv_content, size):
                 os.unlink(p)
 
 
-def flash_nvs(port, baud, nvs_bin):
+def flash_nvs(port, baud, nvs_bin, chip="esp32s3"):
     """Flash the NVS partition binary to the ESP32."""
     with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as f:
         f.write(nvs_bin)
@@ -133,7 +145,7 @@ def flash_nvs(port, baud, nvs_bin):
     try:
         cmd = [
             sys.executable, "-m", "esptool",
-            "--chip", "esp32s3",
+            "--chip", chip,
             "--port", port,
             "--baud", str(baud),
             "write_flash",
@@ -153,6 +165,7 @@ def main():
     )
     parser.add_argument("--port", required=True, help="Serial port (e.g. COM7, /dev/ttyUSB0)")
     parser.add_argument("--baud", type=int, default=460800, help="Flash baud rate (default: 460800)")
+    parser.add_argument("--chip", default="esp32s3", help="Chip type: esp32, esp32s3, esp32c6 (default: esp32s3)")
     parser.add_argument("--ssid", help="WiFi SSID")
     parser.add_argument("--password", help="WiFi password")
     parser.add_argument("--target-ip", help="Aggregator host IP (e.g. 192.168.1.20)")
@@ -268,7 +281,7 @@ def main():
               f"write_flash 0x9000 {out}")
         return
 
-    flash_nvs(args.port, args.baud, nvs_bin)
+    flash_nvs(args.port, args.baud, nvs_bin, chip=args.chip)
 
 
 if __name__ == "__main__":

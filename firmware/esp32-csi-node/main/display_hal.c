@@ -1,16 +1,9 @@
 /**
  * @file display_hal.c
- * @brief ADR-045: SH8601 QSPI AMOLED HAL for Waveshare ESP32-S3-Touch-AMOLED-1.8.
+ * @brief ADR-045: Display HAL — supports multiple panels via compile-time detection.
  *
- * Uses ESP-IDF esp_lcd_panel_io_spi in QSPI mode (quad_mode=true, lcd_cmd_bits=32).
- * The panel_io layer handles the 0x02/0x32 QSPI command encoding.
- *
- * Hardware: SH8601 368x448, FT3168 touch, TCA9554 I/O expander for power/reset.
- *
- * Pin assignments (Waveshare ESP32-S3-Touch-AMOLED-1.8):
- *   QSPI: CS=12, CLK=11, D0=4, D1=5, D2=6, D3=7
- *   I2C:  SDA=15, SCL=14  (shared: touch FT3168 + TCA9554 expander)
- *   Touch INT=21
+ * ESP32-S3: SH8601 QSPI AMOLED 368x448 (Waveshare ESP32-S3-Touch-AMOLED-1.8)
+ * ESP32-C6: ST7789 SPI TFT 172x320  (Waveshare ESP32-C6-LCD-1.47)
  */
 
 #include "display_hal.h"
@@ -25,10 +18,144 @@
 #include "esp_lcd_panel_io.h"
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
-#include "driver/i2c.h"
 #include "esp_heap_caps.h"
 
 static const char *TAG = "disp_hal";
+
+/* ===========================================================================
+ * ESP32-C6: ST7789 SPI TFT — Waveshare ESP32-C6-LCD-1.47 (172x320)
+ * =========================================================================*/
+#if CONFIG_IDF_TARGET_ESP32C6
+
+#include "esp_lcd_panel_ops.h"
+#include "esp_lcd_panel_vendor.h"  /* provides esp_lcd_new_panel_st7789() */
+#include "driver/ledc.h"
+
+/* Pin assignments (Waveshare ESP32-C6-LCD-1.47) */
+#define ST_SCLK     7
+#define ST_MOSI     6
+#define ST_CS       14
+#define ST_DC       15
+#define ST_RST      21
+#define ST_BLK      22
+
+#define ST_H_RES    172
+#define ST_V_RES    320
+
+static esp_lcd_panel_handle_t s_panel = NULL;
+
+esp_err_t display_hal_init_panel(void)
+{
+    ESP_LOGI(TAG, "Initializing Waveshare C6-LCD-1.47 (ST7789 172x320)...");
+
+    /* Backlight — turn on via LEDC PWM */
+    ledc_timer_config_t bl_timer = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = LEDC_TIMER_8_BIT,
+        .timer_num = LEDC_TIMER_0,
+        .freq_hz = 5000,
+        .clk_cfg = LEDC_AUTO_CLK,
+    };
+    ledc_timer_config(&bl_timer);
+
+    ledc_channel_config_t bl_ch = {
+        .gpio_num = ST_BLK,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_0,
+        .timer_sel = LEDC_TIMER_0,
+        .duty = 200,  /* ~80% brightness */
+        .hpoint = 0,
+    };
+    ledc_channel_config(&bl_ch);
+    ESP_LOGI(TAG, "Backlight ON (GPIO %d, PWM)", ST_BLK);
+
+    /* Hardware reset */
+    gpio_config_t rst_cfg = {
+        .pin_bit_mask = (1ULL << ST_RST),
+        .mode = GPIO_MODE_OUTPUT,
+    };
+    gpio_config(&rst_cfg);
+    gpio_set_level(ST_RST, 0);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    gpio_set_level(ST_RST, 1);
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    /* SPI bus */
+    spi_bus_config_t bus_cfg = {
+        .sclk_io_num = ST_SCLK,
+        .mosi_io_num = ST_MOSI,
+        .miso_io_num = -1,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = ST_H_RES * 40 * 2,
+    };
+    ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO));
+
+    /* Panel IO */
+    esp_lcd_panel_io_handle_t io_handle = NULL;
+    esp_lcd_panel_io_spi_config_t io_config = {
+        .dc_gpio_num = ST_DC,
+        .cs_gpio_num = ST_CS,
+        .pclk_hz = 40 * 1000 * 1000,
+        .lcd_cmd_bits = 8,
+        .lcd_param_bits = 8,
+        .spi_mode = 0,
+        .trans_queue_depth = 10,
+    };
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)SPI2_HOST,
+                                             &io_config, &io_handle));
+
+    /* ST7789 panel driver */
+    esp_lcd_panel_dev_config_t panel_config = {
+        .reset_gpio_num = -1,  /* Already reset manually above */
+        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
+        .bits_per_pixel = 16,
+    };
+    ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(io_handle, &panel_config, &s_panel));
+
+    ESP_ERROR_CHECK(esp_lcd_panel_reset(s_panel));
+    ESP_ERROR_CHECK(esp_lcd_panel_init(s_panel));
+
+    /* ST7789 172x320: invert colors (required for this panel) and set orientation */
+    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(s_panel, true));
+    /* Portrait: 172 wide, 320 tall.  Offset for 172-column panel centered in 240-col controller. */
+    ESP_ERROR_CHECK(esp_lcd_panel_set_gap(s_panel, 34, 0));
+    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel, true));
+
+    ESP_LOGI(TAG, "ST7789 panel init OK (%dx%d)", ST_H_RES, ST_V_RES);
+    return ESP_OK;
+}
+
+void display_hal_draw(int x_start, int y_start, int x_end, int y_end,
+                      const void *color_data)
+{
+    if (!s_panel) return;
+    esp_lcd_panel_draw_bitmap(s_panel, x_start, y_start, x_end, y_end, color_data);
+}
+
+esp_err_t display_hal_init_touch(void)
+{
+    /* Non-touch version: no touch controller */
+    ESP_LOGI(TAG, "No touch controller on ESP32-C6-LCD-1.47");
+    return ESP_ERR_NOT_FOUND;
+}
+
+bool display_hal_touch_read(uint16_t *x, uint16_t *y)
+{
+    return false;
+}
+
+void display_hal_set_brightness(uint8_t percent)
+{
+    if (percent > 100) percent = 100;
+    uint32_t duty = (uint32_t)percent * 255 / 100;
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+}
+
+#else /* !CONFIG_IDF_TARGET_ESP32C6 — original S3 AMOLED path */
+
+#include "driver/i2c.h"
 
 /* ---- QSPI Pin Definitions (Waveshare board) ---- */
 #define DISP_QSPI_CS       12
@@ -379,4 +506,5 @@ void display_hal_set_brightness(uint8_t percent)
     panel_write_cmd(0x51, &val, 1);
 }
 
+#endif /* !CONFIG_IDF_TARGET_ESP32C6 */
 #endif /* CONFIG_DISPLAY_ENABLE */

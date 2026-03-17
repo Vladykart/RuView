@@ -1,0 +1,35 @@
+# ESP32-C6 CSI Node — 8MB Embedded Flash SDK Configuration
+# For ESP32-C6FH8 boards (RISC-V, WiFi 6, 8MB flash).
+#
+# Build: idf.py -D SDKCONFIG_DEFAULTS="sdkconfig.defaults.esp32c6" set-target esp32c6 && idf.py build
+
+CONFIG_IDF_TARGET="esp32c6"
+
+# 8MB flash — use the standard partition table (plenty of room for OTA)
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_4mb.csv"
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="8MB"
+
+# Compiler: optimize for size
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+
+# CSI support (critical — WiFi 6 CSI with extended subcarriers)
+CONFIG_ESP_WIFI_CSI_ENABLED=y
+
+# Enable ST7789 TFT display on Waveshare ESP32-C6-LCD-1.47
+CONFIG_DISPLAY_ENABLE=y
+CONFIG_DISPLAY_FPS_LIMIT=20
+
+# LVGL: swap RGB565 bytes for SPI ST7789 (big-endian pixel format)
+CONFIG_LV_COLOR_16_SWAP=y
+
+# Disable WASM tier 3 (no PSRAM)
+# CONFIG_WASM_MAX_MODULES is not set
+
+# Reduce logging to save flash
+CONFIG_BOOTLOADER_LOG_LEVEL_WARN=y
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+CONFIG_LWIP_SO_RCVBUF=y
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
