@@ -1039,6 +1039,7 @@ fn smooth_vitals(state: &mut AppStateInner, raw: &VitalSigns) -> VitalSigns {
         breathing_confidence: state.smoothed_br_conf,
         heartbeat_confidence: state.smoothed_hr_conf,
         signal_quality: raw.signal_quality,
+        displacement_mm: raw.displacement_mm,
     }
 }
 
@@ -1975,6 +1976,19 @@ fn compute_person_score(feat: &FeatureInfo) -> f64 {
 ///
 /// Uses asymmetric thresholds: higher threshold to add a person, lower to remove.
 /// This prevents flickering at the boundary.
+/// Physical location of each sensing node in the room, in METERS as [x, y, z].
+/// Origin = one floor corner of the room; x/y along the walls; z = mounting height.
+/// EDIT these to match where you actually place each board (measure with a tape).
+/// The multistatic mesh uses these to fuse the per-node signals spatially.
+fn node_position(node_id: u8) -> [f64; 3] {
+    match node_id {
+        0 => [0.0, 0.0, 1.2], // node 0 — left side of room
+        1 => [4.0, 0.0, 1.2], // node 1 — right side of room (opposite wall)
+        2 => [2.0, 4.0, 1.2], // node 2 — far side of room (center)
+        _ => [2.0, 0.0, 1.5],
+    }
+}
+
 fn score_to_person_count(smoothed_score: f64) -> usize {
     // Thresholds chosen conservatively for single-ESP32 link:
     //   score > 0.50 → 2 persons (needs sustained high variance + change points)
@@ -3090,7 +3104,7 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                         nodes: vec![NodeInfo {
                             node_id: frame.node_id,
                             rssi_dbm: features.mean_rssi,
-                            position: [2.0, 0.0, 1.5],
+                            position: node_position(frame.node_id),
                             amplitude: frame.amplitudes.iter().take(56).cloned().collect(),
                             subcarrier_count: frame.n_subcarriers as usize,
                         }],
