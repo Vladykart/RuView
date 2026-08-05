@@ -22,6 +22,7 @@ typedef enum {
     MMWAVE_TYPE_NONE      = 0,  /**< No sensor detected. */
     MMWAVE_TYPE_MR60BHA2  = 1,  /**< Seeed MR60BHA2 (60 GHz, HR + BR). */
     MMWAVE_TYPE_LD2410    = 2,  /**< HLK-LD2410 (24 GHz, presence + range). */
+    MMWAVE_TYPE_C1001     = 3,  /**< DFRobot C1001 (60 GHz, presence + fall + HR + BR). */
     MMWAVE_TYPE_MOCK      = 99, /**< Mock sensor for QEMU testing. */
 } mmwave_type_t;
 
@@ -44,8 +45,9 @@ typedef struct {
     float    heart_rate_bpm;    /**< Heart rate in BPM (0 if unavailable). */
     float    breathing_rate;    /**< Breathing rate in breaths/min. */
 
-    /* Presence and range (LD2410 / MR60BHA2) */
+    /* Presence and range (LD2410 / MR60BHA2 / C1001) */
     bool     person_present;    /**< True if person detected. */
+    bool     fall_detected;     /**< True if a fall event is reported (C1001). */
     float    distance_cm;       /**< Distance to nearest target in cm. */
     uint8_t  target_count;      /**< Number of detected targets. */
 

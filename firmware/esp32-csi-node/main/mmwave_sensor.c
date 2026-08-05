@@ -66,6 +66,22 @@ static const char *TAG = "mmwave";
 #define LD2410_REPORT_HEAD  0xAA
 #define LD2410_REPORT_TAIL  0x55
 
+/* ---- DFRobot C1001 protocol constants (60 GHz, query/response) ----
+ * Frame: 0x53 0x59 <con> <cmd> <len_hi> <len_lo> <data..> <cksum> 0x54 0x43
+ * cksum = sum(bytes from 0x53 through last data byte) & 0xFF.
+ * Queries carry one data byte 0x0F; responses echo <con>/<cmd> with values.
+ */
+#define C1001_BAUD          115200
+#define C1001_HDR0          0x53
+#define C1001_HDR1          0x59
+#define C1001_TAIL0         0x54
+#define C1001_TAIL1         0x43
+#define C1001_CON_STATUS    0x80  /* cmd 0x81 presence, 0x82 motion */
+#define C1001_CON_BREATH    0x81  /* cmd 0x82 breathing rate */
+#define C1001_CON_FALL      0x83  /* cmd 0x81 fall state */
+#define C1001_CON_HEART     0x85  /* cmd 0x82 heart rate */
+#define C1001_MAX_DATA      40
+
 /* ---- Shared state ---- */
 static mmwave_state_t s_state;
 static volatile bool s_running;
@@ -308,6 +324,116 @@ static void ld2410_feed_byte(uint8_t b)
 }
 
 /* ======================================================================
+ * C1001 Parser + Querier (DFRobot query/response protocol, 115200 baud)
+ * ====================================================================== */
+
+typedef enum {
+    C1001_WAIT_53, C1001_WAIT_59,
+    C1001_READ_CON, C1001_READ_CMD,
+    C1001_READ_LEN_H, C1001_READ_LEN_L,
+    C1001_READ_DATA, C1001_READ_CKSUM,
+    C1001_WAIT_54, C1001_WAIT_43,
+} c1001_parse_state_t;
+
+typedef struct {
+    c1001_parse_state_t state;
+    uint8_t  con;
+    uint8_t  cmd;
+    uint16_t data_len;
+    uint16_t data_idx;
+    uint8_t  data[C1001_MAX_DATA];
+    uint16_t cksum_acc;   /* Running sum of header+data bytes. */
+    uint8_t  cksum_rx;
+} c1001_parser_t;
+
+static c1001_parser_t s_c1001;
+
+#ifndef CONFIG_CSI_MOCK_ENABLED
+static void c1001_send_query(uint8_t con, uint8_t cmd)
+{
+    uint8_t frame[10] = { C1001_HDR0, C1001_HDR1, con, cmd, 0x00, 0x01, 0x0F,
+                          0, C1001_TAIL0, C1001_TAIL1 };
+    uint16_t sum = 0;
+    for (int i = 0; i < 7; i++) sum += frame[i];
+    frame[7] = (uint8_t)(sum & 0xFF);
+    uart_write_bytes(MMWAVE_UART_NUM, frame, sizeof(frame));
+}
+#endif
+
+static void c1001_process_frame(uint8_t con, uint8_t cmd,
+                                const uint8_t *data, uint16_t len)
+{
+    if (len < 1) return;
+    s_state.frame_count++;
+    s_state.last_update_us = esp_timer_get_time();
+
+    if (con == C1001_CON_STATUS && cmd == 0x81) {
+        s_state.person_present = (data[0] != 0);
+        s_state.target_count = (data[0] != 0) ? 1 : 0;
+    } else if (con == C1001_CON_STATUS && cmd == 0x82) {
+        /* Motion: 0=none, 1=static, 2=active — presence handled above. */
+    } else if (con == C1001_CON_BREATH && cmd == 0x82) {
+        if (data[0] > 0 && data[0] <= 60) s_state.breathing_rate = (float)data[0];
+    } else if (con == C1001_CON_HEART && cmd == 0x82) {
+        if (data[0] > 0 && data[0] <= 250) s_state.heart_rate_bpm = (float)data[0];
+    } else if (con == C1001_CON_FALL && cmd == 0x81) {
+        s_state.fall_detected = (data[0] != 0);
+    }
+}
+
+static void c1001_feed_byte(uint8_t b)
+{
+    switch (s_c1001.state) {
+    case C1001_WAIT_53:
+        if (b == C1001_HDR0) { s_c1001.cksum_acc = b; s_c1001.state = C1001_WAIT_59; }
+        break;
+    case C1001_WAIT_59:
+        if (b == C1001_HDR1) { s_c1001.cksum_acc += b; s_c1001.state = C1001_READ_CON; }
+        else s_c1001.state = C1001_WAIT_53;
+        break;
+    case C1001_READ_CON:
+        s_c1001.con = b; s_c1001.cksum_acc += b; s_c1001.state = C1001_READ_CMD;
+        break;
+    case C1001_READ_CMD:
+        s_c1001.cmd = b; s_c1001.cksum_acc += b; s_c1001.state = C1001_READ_LEN_H;
+        break;
+    case C1001_READ_LEN_H:
+        s_c1001.data_len = (uint16_t)b << 8; s_c1001.cksum_acc += b;
+        s_c1001.state = C1001_READ_LEN_L;
+        break;
+    case C1001_READ_LEN_L:
+        s_c1001.data_len |= b; s_c1001.cksum_acc += b; s_c1001.data_idx = 0;
+        if (s_c1001.data_len == 0 || s_c1001.data_len > C1001_MAX_DATA) {
+            s_c1001.state = C1001_WAIT_53;
+        } else {
+            s_c1001.state = C1001_READ_DATA;
+        }
+        break;
+    case C1001_READ_DATA:
+        s_c1001.data[s_c1001.data_idx++] = b; s_c1001.cksum_acc += b;
+        if (s_c1001.data_idx >= s_c1001.data_len) s_c1001.state = C1001_READ_CKSUM;
+        break;
+    case C1001_READ_CKSUM:
+        s_c1001.cksum_rx = b; s_c1001.state = C1001_WAIT_54;
+        break;
+    case C1001_WAIT_54:
+        s_c1001.state = (b == C1001_TAIL0) ? C1001_WAIT_43 : C1001_WAIT_53;
+        break;
+    case C1001_WAIT_43:
+        if (b == C1001_TAIL1) {
+            if ((uint8_t)(s_c1001.cksum_acc & 0xFF) == s_c1001.cksum_rx) {
+                c1001_process_frame(s_c1001.con, s_c1001.cmd,
+                                    s_c1001.data, s_c1001.data_len);
+            } else {
+                s_state.error_count++;
+            }
+        }
+        s_c1001.state = C1001_WAIT_53;
+        break;
+    }
+}
+
+/* ======================================================================
  * Mock mmWave Generator (for QEMU testing)
  * ====================================================================== */
 
@@ -410,8 +536,36 @@ static mmwave_type_t probe_at_baud(uint32_t baud)
 }
 
 /**
+ * Actively probe for a DFRobot C1001: it is query/response (silent until
+ * asked), so send presence queries and look for a valid 0x53 0x59 reply.
+ */
+static mmwave_type_t probe_c1001(void)
+{
+    uart_set_baudrate(MMWAVE_UART_NUM, C1001_BAUD);
+    uart_flush_input(MMWAVE_UART_NUM);
+
+    uint8_t buf[64];
+    for (int attempt = 0; attempt < 6; attempt++) {
+        /* Alternate device-status (0x01/0x83, what DFRobot begin() uses)
+         * and presence queries — a booting C1001 answers status first. */
+        if (attempt % 2 == 0) c1001_send_query(0x01, 0x83);
+        else                  c1001_send_query(C1001_CON_STATUS, 0x81);
+        int64_t deadline = esp_timer_get_time() + 500 * 1000;
+        while (esp_timer_get_time() < deadline) {
+            int len = uart_read_bytes(MMWAVE_UART_NUM, buf, sizeof(buf), pdMS_TO_TICKS(50));
+            for (int i = 0; i + 1 < len; i++) {
+                if (buf[i] == C1001_HDR0 && buf[i + 1] == C1001_HDR1) {
+                    return MMWAVE_TYPE_C1001;
+                }
+            }
+        }
+    }
+    return MMWAVE_TYPE_NONE;
+}
+
+/**
  * Auto-detect sensor by probing at both baud rates.
- * MR60BHA2 uses 115200, LD2410 uses 256000.
+ * MR60BHA2 uses 115200, LD2410 uses 256000; C1001 needs an active query.
  */
 static mmwave_type_t probe_sensor(void)
 {
@@ -421,6 +575,10 @@ static mmwave_type_t probe_sensor(void)
 
     ESP_LOGI(TAG, "Probing at %d baud (LD2410)...", MMWAVE_LD2410_BAUD);
     result = probe_at_baud(MMWAVE_LD2410_BAUD);
+    if (result != MMWAVE_TYPE_NONE) return result;
+
+    ESP_LOGI(TAG, "Probing at %d baud (C1001, active query)...", C1001_BAUD);
+    result = probe_c1001();
     return result;
 }
 
@@ -431,8 +589,26 @@ static void mmwave_uart_task(void *arg)
              mmwave_type_name(s_state.type));
 
     uint8_t buf[128];
+    /* C1001 is query/response: round-robin one query per 200 ms so each
+     * metric refreshes at ~1 Hz. */
+    static const uint8_t c1001_queries[][2] = {
+        { C1001_CON_STATUS, 0x81 },  /* presence  */
+        { C1001_CON_STATUS, 0x82 },  /* motion    */
+        { C1001_CON_BREATH, 0x82 },  /* breathing */
+        { C1001_CON_HEART,  0x82 },  /* heart     */
+        { C1001_CON_FALL,   0x81 },  /* fall      */
+    };
+    int q_idx = 0;
+    int64_t next_query_us = 0;
 
     while (s_running) {
+        if (s_state.type == MMWAVE_TYPE_C1001
+            && esp_timer_get_time() >= next_query_us) {
+            c1001_send_query(c1001_queries[q_idx][0], c1001_queries[q_idx][1]);
+            q_idx = (q_idx + 1) % 5;
+            next_query_us = esp_timer_get_time() + 200 * 1000;
+        }
+
         int len = uart_read_bytes(MMWAVE_UART_NUM, buf, sizeof(buf), pdMS_TO_TICKS(100));
         if (len <= 0) {
             vTaskDelay(1);
@@ -444,6 +620,8 @@ static void mmwave_uart_task(void *arg)
                 mr60_feed_byte(buf[i]);
             } else if (s_state.type == MMWAVE_TYPE_LD2410) {
                 ld2410_feed_byte(buf[i]);
+            } else if (s_state.type == MMWAVE_TYPE_C1001) {
+                c1001_feed_byte(buf[i]);
             }
         }
 
@@ -453,80 +631,26 @@ static void mmwave_uart_task(void *arg)
     vTaskDelete(NULL);
 }
 
-#endif /* !CONFIG_CSI_MOCK_ENABLED */
+/* Candidate pin sets shared with the deferred re-probe task. */
+static int s_pin_sets[3][2];
+static int s_n_pin_sets;
 
-/* ======================================================================
- * Public API
- * ====================================================================== */
-
-const char *mmwave_type_name(mmwave_type_t type)
+static mmwave_type_t probe_all_pinsets(void)
 {
-    switch (type) {
-    case MMWAVE_TYPE_MR60BHA2: return "MR60BHA2";
-    case MMWAVE_TYPE_LD2410:   return "LD2410";
-    case MMWAVE_TYPE_MOCK:     return "Mock";
-    case MMWAVE_TYPE_NONE:
-    default:                   return "None";
+    mmwave_type_t detected = MMWAVE_TYPE_NONE;
+    for (int p = 0; p < s_n_pin_sets && detected == MMWAVE_TYPE_NONE; p++) {
+        uart_set_pin(MMWAVE_UART_NUM, s_pin_sets[p][0], s_pin_sets[p][1],
+                     UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+        ESP_LOGI(TAG, "Probing UART%d (TX=%d, RX=%d) for mmWave sensor...",
+                 MMWAVE_UART_NUM, s_pin_sets[p][0], s_pin_sets[p][1]);
+        detected = probe_sensor();
     }
+    return detected;
 }
 
-esp_err_t mmwave_sensor_init(int uart_tx_pin, int uart_rx_pin)
+/* Configure state for a detected sensor and start the parser task. */
+static esp_err_t mmwave_finalize(mmwave_type_t detected)
 {
-    memset(&s_state, 0, sizeof(s_state));
-    memset(&s_mr60, 0, sizeof(s_mr60));
-    memset(&s_ld, 0, sizeof(s_ld));
-    s_running = true;
-
-#ifdef CONFIG_CSI_MOCK_ENABLED
-    ESP_LOGI(TAG, "Mock mode: starting synthetic mmWave generator");
-
-    BaseType_t ret = xTaskCreatePinnedToCore(
-        mock_mmwave_task, "mmwave_mock", MMWAVE_TASK_STACK,
-        NULL, MMWAVE_TASK_PRIORITY, NULL, 0);
-
-    if (ret != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create mock mmWave task");
-        return ESP_ERR_NO_MEM;
-    }
-
-    return ESP_OK;
-
-#else
-    if (uart_tx_pin < 0) uart_tx_pin = 17;
-    if (uart_rx_pin < 0) uart_rx_pin = 18;
-
-    /* Install UART driver at MR60 baud (will be changed during probe). */
-    uart_config_t uart_config = {
-        .baud_rate = MMWAVE_MR60_BAUD,
-        .data_bits = UART_DATA_8_BITS,
-        .parity    = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,
-    };
-
-    esp_err_t err = uart_driver_install(MMWAVE_UART_NUM, MMWAVE_BUF_SIZE * 2, 0, 0, NULL, 0);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "UART driver install failed: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    uart_param_config(MMWAVE_UART_NUM, &uart_config);
-    uart_set_pin(MMWAVE_UART_NUM, uart_tx_pin, uart_rx_pin,
-                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-
-    ESP_LOGI(TAG, "Probing UART%d (TX=%d, RX=%d) for mmWave sensor...",
-             MMWAVE_UART_NUM, uart_tx_pin, uart_rx_pin);
-
-    mmwave_type_t detected = probe_sensor();
-
-    if (detected == MMWAVE_TYPE_NONE) {
-        ESP_LOGI(TAG, "No mmWave sensor detected on UART%d", MMWAVE_UART_NUM);
-        uart_driver_delete(MMWAVE_UART_NUM);
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    /* Set final baud rate for the detected sensor. */
     uint32_t final_baud = (detected == MMWAVE_TYPE_LD2410)
                           ? MMWAVE_LD2410_BAUD : MMWAVE_MR60_BAUD;
     uart_set_baudrate(MMWAVE_UART_NUM, final_baud);
@@ -541,6 +665,10 @@ esp_err_t mmwave_sensor_init(int uart_tx_pin, int uart_rx_pin)
         break;
     case MMWAVE_TYPE_LD2410:
         s_state.capabilities = MMWAVE_CAP_PRESENCE | MMWAVE_CAP_DISTANCE;
+        break;
+    case MMWAVE_TYPE_C1001:
+        s_state.capabilities = MMWAVE_CAP_HEART_RATE | MMWAVE_CAP_BREATHING
+                             | MMWAVE_CAP_PRESENCE | MMWAVE_CAP_FALL;
         break;
     default:
         break;
@@ -558,8 +686,125 @@ esp_err_t mmwave_sensor_init(int uart_tx_pin, int uart_rx_pin)
         ESP_LOGE(TAG, "Failed to create mmWave UART task");
         return ESP_ERR_NO_MEM;
     }
+    return ESP_OK;
+}
+
+/* Deferred re-probe for sensors that boot slower than the firmware. */
+static void mmwave_retry_task(void *arg)
+{
+    (void)arg;
+    for (int round = 0; round < 3 && s_running; round++) {
+        vTaskDelay(pdMS_TO_TICKS(12000));
+        mmwave_type_t detected = probe_all_pinsets();
+        if (detected != MMWAVE_TYPE_NONE) {
+            ESP_LOGI(TAG, "Deferred probe round %d found a sensor", round + 1);
+            mmwave_finalize(detected);
+            vTaskDelete(NULL);
+            return;
+        }
+    }
+    ESP_LOGI(TAG, "Deferred probes exhausted — no mmWave sensor");
+    uart_driver_delete(MMWAVE_UART_NUM);
+    vTaskDelete(NULL);
+}
+
+#endif /* !CONFIG_CSI_MOCK_ENABLED */
+
+/* ======================================================================
+ * Public API
+ * ====================================================================== */
+
+const char *mmwave_type_name(mmwave_type_t type)
+{
+    switch (type) {
+    case MMWAVE_TYPE_MR60BHA2: return "MR60BHA2";
+    case MMWAVE_TYPE_LD2410:   return "LD2410";
+    case MMWAVE_TYPE_C1001:    return "C1001";
+    case MMWAVE_TYPE_MOCK:     return "Mock";
+    case MMWAVE_TYPE_NONE:
+    default:                   return "None";
+    }
+}
+
+esp_err_t mmwave_sensor_init(int uart_tx_pin, int uart_rx_pin)
+{
+    memset(&s_state, 0, sizeof(s_state));
+    memset(&s_mr60, 0, sizeof(s_mr60));
+    memset(&s_ld, 0, sizeof(s_ld));
+    memset(&s_c1001, 0, sizeof(s_c1001));
+    s_running = true;
+
+#ifdef CONFIG_CSI_MOCK_ENABLED
+    ESP_LOGI(TAG, "Mock mode: starting synthetic mmWave generator");
+
+    BaseType_t ret = xTaskCreatePinnedToCore(
+        mock_mmwave_task, "mmwave_mock", MMWAVE_TASK_STACK,
+        NULL, MMWAVE_TASK_PRIORITY, NULL, 0);
+
+    if (ret != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create mock mmWave task");
+        return ESP_ERR_NO_MEM;
+    }
 
     return ESP_OK;
+
+#else
+    /* Candidate (TX, RX) pin pairs. On the StickS3 the sensor hangs off the
+     * Grove PORT.A connector (G9/G10) with unknown orientation; other boards
+     * use the legacy UART1 pins 17/18. Explicit pins override the list. */
+    int pin_sets[3][2];
+    int n_pin_sets;
+    if (uart_tx_pin >= 0 && uart_rx_pin >= 0) {
+        pin_sets[0][0] = uart_tx_pin; pin_sets[0][1] = uart_rx_pin;
+        n_pin_sets = 1;
+    } else {
+#if CONFIG_DISPLAY_STICKS3
+        pin_sets[0][0] = 9;  pin_sets[0][1] = 10;
+        pin_sets[1][0] = 10; pin_sets[1][1] = 9;
+        pin_sets[2][0] = 17; pin_sets[2][1] = 18;
+        n_pin_sets = 3;
+#else
+        pin_sets[0][0] = 17; pin_sets[0][1] = 18;
+        n_pin_sets = 1;
+#endif
+    }
+
+    /* Install UART driver at MR60 baud (will be changed during probe). */
+    uart_config_t uart_config = {
+        .baud_rate = MMWAVE_MR60_BAUD,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+
+    esp_err_t err = uart_driver_install(MMWAVE_UART_NUM, MMWAVE_BUF_SIZE * 2,
+                                        MMWAVE_BUF_SIZE * 2, 0, NULL, 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "UART driver install failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    uart_param_config(MMWAVE_UART_NUM, &uart_config);
+
+    memcpy(s_pin_sets, pin_sets, sizeof(pin_sets));
+    s_n_pin_sets = n_pin_sets;
+
+    mmwave_type_t detected = probe_all_pinsets();
+
+    if (detected == MMWAVE_TYPE_NONE) {
+        /* Slow-boot sensors (C1001 needs ~10 s) can miss the boot-time
+         * probe — keep the driver and retry in the background. */
+        ESP_LOGI(TAG, "No mmWave sensor yet on UART%d — deferred re-probe scheduled",
+                 MMWAVE_UART_NUM);
+        BaseType_t rret = xTaskCreatePinnedToCore(
+            mmwave_retry_task, "mmwave_retry", MMWAVE_TASK_STACK,
+            NULL, MMWAVE_TASK_PRIORITY, NULL, 0);
+        if (rret != pdPASS) uart_driver_delete(MMWAVE_UART_NUM);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    return mmwave_finalize(detected);
 #endif
 }
 

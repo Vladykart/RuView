@@ -23,6 +23,7 @@
 #include "nvs_config.h"
 #include "edge_processing.h"
 #include "ota_update.h"
+#include "esp_ota_ops.h"
 #include "power_mgmt.h"
 #include "wasm_runtime.h"
 #include "wasm_upload.h"
@@ -262,6 +263,15 @@ void app_main(void)
              (ota_ret == ESP_OK) ? "ready" : "off",
              (wasm_ret == ESP_OK) ? "ready" : "off",
              (mmwave_ret == ESP_OK) ? "active" : "off");
+
+    /* OTA rollback health gate: we only get here with WiFi joined, CSI
+     * capture running, and the OTA server up — accept this image. An
+     * image that dies before this point never cancels rollback and the
+     * bootloader reverts to the previous slot on the next reset. */
+    esp_err_t valid_ret = esp_ota_mark_app_valid_cancel_rollback();
+    if (valid_ret == ESP_OK) {
+        ESP_LOGI(TAG, "OTA image marked valid — rollback cancelled");
+    }
 
     /* Main loop — keep alive */
     while (1) {
