@@ -8,3 +8,6 @@ dependencies:
 
   ## LCD touch abstraction
   espressif/esp_lcd_touch: "^1.0"
+
+  ## ILI9341/ILI9342C panel driver (ESP32-S3-BOX-3 older units)
+  espressif/esp_lcd_ili9341: "^2"

@@ -402,7 +402,9 @@ void display_hal_set_brightness(uint8_t percent)
 
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"
+#include "esp_lcd_ili9341.h"
 #include "driver/ledc.h"
+#include "driver/i2c.h"
 
 #define BOX3_MOSI      6
 #define BOX3_SCLK      7
@@ -410,15 +412,70 @@ void display_hal_set_brightness(uint8_t percent)
 #define BOX3_DC        4
 #define BOX3_RST       48
 #define BOX3_BLK       47
+#define BOX3_I2C_SDA   8
+#define BOX3_I2C_SCL   18
 
 #define ST_H_RES       320
 #define ST_V_RES       240
 
 static esp_lcd_panel_handle_t s_panel = NULL;
 
+/* ILI9342C init sequence from espressif/esp-bsp esp-box-3 (older units). */
+static const ili9341_lcd_init_cmd_t box3_ili9342c_init[] = {
+    {0xC8, (uint8_t []){0xFF, 0x93, 0x42}, 3, 0},
+    {0xC0, (uint8_t []){0x0E, 0x0E}, 2, 0},
+    {0xC5, (uint8_t []){0xD0}, 1, 0},
+    {0xC1, (uint8_t []){0x02}, 1, 0},
+    {0xB4, (uint8_t []){0x02}, 1, 0},
+    {0xE0, (uint8_t []){0x00, 0x03, 0x08, 0x06, 0x13, 0x09, 0x39, 0x39, 0x48,
+                        0x02, 0x0a, 0x08, 0x17, 0x17, 0x0F}, 15, 0},
+    {0xE1, (uint8_t []){0x00, 0x28, 0x29, 0x01, 0x0d, 0x03, 0x3f, 0x33, 0x52,
+                        0x04, 0x0f, 0x0e, 0x37, 0x38, 0x0F}, 15, 0},
+    {0xB1, (uint8_t []){0x00, 0x1B}, 2, 0},
+    {0x36, (uint8_t []){0x08}, 1, 0},
+    {0x3A, (uint8_t []){0x55}, 1, 0},
+    {0xB7, (uint8_t []){0x06}, 1, 0},
+    {0x11, (uint8_t []){0}, 0x80, 0},
+    {0x29, (uint8_t []){0}, 0x80, 0},
+    {0, (uint8_t []){0}, 0xff, 0},
+};
+
+/* Probe an I2C address; BOX-3 panel type follows the touch chip:
+ * TT21100 (0x24) pairs with ST7789, GT911 (0x5D/0x14) with ILI9342C. */
+static bool box3_i2c_probe(uint8_t addr)
+{
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_stop(cmd);
+    esp_err_t err = i2c_master_cmd_begin(I2C_NUM_0, cmd, pdMS_TO_TICKS(50));
+    i2c_cmd_link_delete(cmd);
+    return err == ESP_OK;
+}
+
 esp_err_t display_hal_init_panel(void)
 {
     ESP_LOGI(TAG, "Initializing S3-BOX-3 panel (%dx%d)...", ST_H_RES, ST_V_RES);
+
+    /* Identify the panel generation via the touch controller. */
+    i2c_config_t i2c_cfg = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = BOX3_I2C_SDA,
+        .scl_io_num = BOX3_I2C_SCL,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = 100000,
+    };
+    bool is_st7789 = false;
+    if (i2c_param_config(I2C_NUM_0, &i2c_cfg) == ESP_OK
+        && i2c_driver_install(I2C_NUM_0, I2C_MODE_MASTER, 0, 0, 0) == ESP_OK) {
+        is_st7789 = box3_i2c_probe(0x24);           /* TT21100 */
+        bool gt911 = box3_i2c_probe(0x5D) || box3_i2c_probe(0x14);
+        ESP_LOGI(TAG, "Touch probe: TT21100=%d GT911=%d -> %s panel",
+                 is_st7789, gt911, is_st7789 ? "ST7789" : "ILI9342C");
+    } else {
+        ESP_LOGW(TAG, "I2C probe unavailable — defaulting to ILI9342C");
+    }
 
     /* Backlight via LEDC PWM, active high */
     ledc_timer_config_t bl_timer = {
@@ -438,16 +495,6 @@ esp_err_t display_hal_init_panel(void)
         .hpoint = 0,
     };
     ledc_channel_config(&bl_ch);
-
-    gpio_config_t rst_cfg = {
-        .pin_bit_mask = (1ULL << BOX3_RST),
-        .mode = GPIO_MODE_OUTPUT,
-    };
-    gpio_config(&rst_cfg);
-    gpio_set_level(BOX3_RST, 0);
-    vTaskDelay(pdMS_TO_TICKS(100));
-    gpio_set_level(BOX3_RST, 1);
-    vTaskDelay(pdMS_TO_TICKS(100));
 
     spi_bus_config_t bus_cfg = {
         .sclk_io_num = BOX3_SCLK,
@@ -472,12 +519,25 @@ esp_err_t display_hal_init_panel(void)
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)SPI3_HOST,
                                              &io_config, &io_handle));
 
+    /* Per esp-bsp: the BOX-3 LCD reset line is ACTIVE HIGH — let the
+     * driver own it (a manual low->high "release" holds the panel in
+     * reset and shows a white screen). Color order is BGR. */
+    const ili9341_vendor_config_t vendor_config = {
+        .init_cmds = box3_ili9342c_init,
+        .init_cmds_size = sizeof(box3_ili9342c_init) / sizeof(box3_ili9342c_init[0]),
+    };
     esp_lcd_panel_dev_config_t panel_config = {
-        .reset_gpio_num = -1,  /* Already reset manually above */
-        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
+        .reset_gpio_num = BOX3_RST,
+        .flags.reset_active_high = 1,
+        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_BGR,
         .bits_per_pixel = 16,
     };
-    ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(io_handle, &panel_config, &s_panel));
+    if (is_st7789) {
+        ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(io_handle, &panel_config, &s_panel));
+    } else {
+        panel_config.vendor_config = (void *)&vendor_config;
+        ESP_ERROR_CHECK(esp_lcd_new_panel_ili9341(io_handle, &panel_config, &s_panel));
+    }
 
     ESP_ERROR_CHECK(esp_lcd_panel_reset(s_panel));
     ESP_ERROR_CHECK(esp_lcd_panel_init(s_panel));
@@ -485,7 +545,8 @@ esp_err_t display_hal_init_panel(void)
     ESP_ERROR_CHECK(esp_lcd_panel_mirror(s_panel, true, true));
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel, true));
 
-    ESP_LOGI(TAG, "Panel init OK (S3-BOX-3 %dx%d)", ST_H_RES, ST_V_RES);
+    ESP_LOGI(TAG, "Panel init OK (S3-BOX-3 %dx%d, %s)", ST_H_RES, ST_V_RES,
+             is_st7789 ? "ST7789" : "ILI9342C");
     return ESP_OK;
 }
 
