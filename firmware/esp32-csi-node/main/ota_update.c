@@ -106,6 +106,25 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
 }
 
 /**
+ * GET /ota/diag — mmWave wiring/probe diagnostics for headless nodes.
+ */
+static esp_err_t ota_diag_handler(httpd_req_t *req)
+{
+    mmwave_state_t mw;
+    bool has_mw = mmwave_sensor_get_state(&mw);
+    char response[768];
+    int len = snprintf(response, sizeof(response),
+        "{\"mmwave\":\"%s\",\"pins\":\"%s\",\"frames\":%lu,\"errors\":%lu}",
+        has_mw ? mmwave_type_name(mw.type) : "none",
+        mmwave_get_diag(),
+        (unsigned long)(has_mw ? mw.frame_count : 0),
+        (unsigned long)(has_mw ? mw.error_count : 0));
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, response, len);
+    return ESP_OK;
+}
+
+/**
  * POST /ota — receive and flash firmware binary.
  */
 static esp_err_t ota_upload_handler(httpd_req_t *req)
@@ -237,6 +256,14 @@ static esp_err_t ota_start_server(httpd_handle_t *out_handle)
         .user_ctx = NULL,
     };
     httpd_register_uri_handler(server, &status_uri);
+
+    httpd_uri_t diag_uri = {
+        .uri      = "/ota/diag",
+        .method   = HTTP_GET,
+        .handler  = ota_diag_handler,
+        .user_ctx = NULL,
+    };
+    httpd_register_uri_handler(server, &diag_uri);
 
     httpd_uri_t upload_uri = {
         .uri      = "/ota",

@@ -82,4 +82,10 @@ bool mmwave_sensor_get_state(mmwave_state_t *state);
  */
 const char *mmwave_type_name(mmwave_type_t type);
 
+/**
+ * Get the boot-time wiring/probe diagnostic transcript (for remote
+ * debugging of headless nodes via the OTA HTTP server).
+ */
+const char *mmwave_get_diag(void);
+
 #endif /* MMWAVE_SENSOR_H */

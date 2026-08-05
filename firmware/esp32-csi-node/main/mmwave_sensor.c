@@ -28,6 +28,7 @@
 #include "mmwave_sensor.h"
 
 #include <string.h>
+#include <stdarg.h>
 #include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -545,13 +546,30 @@ static void c1001_io_pins_poll(void);
  * Actively probe for a DFRobot C1001: it is query/response (silent until
  * asked), so send presence queries and look for a valid 0x53 0x59 reply.
  */
+static mmwave_type_t probe_c1001_at(uint32_t baud);
+
 static mmwave_type_t probe_c1001(void)
 {
-    uart_set_baudrate(MMWAVE_UART_NUM, C1001_BAUD);
+    /* 115200 is the documented default; scan fallbacks in case the unit
+     * shipped configured differently. */
+    static const uint32_t bauds[] = { 115200, 9600, 57600, 256000 };
+    for (size_t b = 0; b < sizeof(bauds) / sizeof(bauds[0]); b++) {
+        mmwave_type_t r = probe_c1001_at(bauds[b]);
+        if (r != MMWAVE_TYPE_NONE) {
+            ESP_LOGI(TAG, "C1001 answered at %lu baud", (unsigned long)bauds[b]);
+            return r;
+        }
+    }
+    return MMWAVE_TYPE_NONE;
+}
+
+static mmwave_type_t probe_c1001_at(uint32_t baud)
+{
+    uart_set_baudrate(MMWAVE_UART_NUM, baud);
     uart_flush_input(MMWAVE_UART_NUM);
 
     uint8_t buf[64];
-    for (int attempt = 0; attempt < 6; attempt++) {
+    for (int attempt = 0; attempt < 2; attempt++) {
         /* Alternate device-status (0x01/0x83, what DFRobot begin() uses)
          * and presence queries — a booting C1001 answers status first. */
         if (attempt % 2 == 0) c1001_send_query(0x01, 0x83);
@@ -659,6 +677,28 @@ static int s_n_pin_sets;
 #define C1001_IO_PIN_A  5
 #define C1001_IO_PIN_B  7
 
+/* Diagnostic transcript kept in RAM so headless nodes can serve it
+ * remotely (GET /ota/diag). */
+static char s_diag_buf[512];
+static size_t s_diag_len;
+
+static void diag_log(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    if (s_diag_len < sizeof(s_diag_buf) - 1) {
+        int n = vsnprintf(s_diag_buf + s_diag_len,
+                          sizeof(s_diag_buf) - s_diag_len, fmt, ap);
+        if (n > 0) s_diag_len += (size_t)n;
+    }
+    va_end(ap);
+}
+
+const char *mmwave_get_diag(void)
+{
+    return s_diag_buf;
+}
+
 /* Electrical diagnosis: a pin actively driven by the radar holds its level
  * regardless of our pull; a floating (unconnected) pin follows the pull. */
 static void c1001_io_pin_diagnose(int pin)
@@ -671,10 +711,11 @@ static void c1001_io_pin_diagnose(int pin)
     vTaskDelay(pdMS_TO_TICKS(10));
     int with_up = gpio_get_level(pin);
     const char *verdict = (with_down == with_up)
-        ? (with_down ? "DRIVEN HIGH" : "DRIVEN LOW")
-        : "FLOATING (not connected?)";
+        ? (with_down ? "DRIVEN-HIGH" : "DRIVEN-LOW")
+        : "FLOATING";
     ESP_LOGI(TAG, "C1001 IO G%d: pulldown=%d pullup=%d -> %s",
              pin, with_down, with_up, verdict);
+    diag_log("G%d=%s; ", pin, verdict);
 }
 
 static void c1001_io_pins_init(void)
@@ -876,6 +917,10 @@ esp_err_t mmwave_sensor_init(int uart_tx_pin, int uart_rx_pin)
 
 #if CONFIG_DISPLAY_STICKS3
     c1001_io_pins_init();
+    /* UART wire check before the driver claims the pins: a connected idle
+     * UART TX from the sensor holds the line HIGH; floating = no wire. */
+    c1001_io_pin_diagnose(43);
+    c1001_io_pin_diagnose(44);
 #endif
 
     /* Install UART driver at MR60 baud (will be changed during probe). */
