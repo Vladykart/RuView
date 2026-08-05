@@ -37,6 +37,7 @@
 
 #ifndef CONFIG_CSI_MOCK_ENABLED
 #include "driver/uart.h"
+#include "driver/gpio.h"
 #endif
 
 static const char *TAG = "mmwave";
@@ -535,6 +536,11 @@ static mmwave_type_t probe_at_baud(uint32_t baud)
     return MMWAVE_TYPE_NONE;
 }
 
+#if CONFIG_DISPLAY_STICKS3
+static void c1001_io_pins_init(void);
+static void c1001_io_pins_poll(void);
+#endif
+
 /**
  * Actively probe for a DFRobot C1001: it is query/response (silent until
  * asked), so send presence queries and look for a valid 0x53 0x59 reply.
@@ -609,6 +615,10 @@ static void mmwave_uart_task(void *arg)
             next_query_us = esp_timer_get_time() + 200 * 1000;
         }
 
+#if CONFIG_DISPLAY_STICKS3
+        c1001_io_pins_poll();
+#endif
+
         int len = uart_read_bytes(MMWAVE_UART_NUM, buf, sizeof(buf), pdMS_TO_TICKS(100));
         if (len <= 0) {
             vTaskDelay(1);
@@ -632,8 +642,44 @@ static void mmwave_uart_task(void *arg)
 }
 
 /* Candidate pin sets shared with the deferred re-probe task. */
-static int s_pin_sets[3][2];
+static int s_pin_sets[5][2];
 static int s_n_pin_sets;
+
+#if CONFIG_DISPLAY_STICKS3
+/* C1001 hardware presence/event outputs wired to the StickS3 HAT header. */
+#define C1001_IO_PIN_A  5
+#define C1001_IO_PIN_B  7
+
+static void c1001_io_pins_init(void)
+{
+    gpio_config_t io_cfg = {
+        .pin_bit_mask = (1ULL << C1001_IO_PIN_A) | (1ULL << C1001_IO_PIN_B),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,  /* radar drives high on event */
+    };
+    gpio_config(&io_cfg);
+}
+
+/* Poll the radar's digital outputs. Logs transitions so the pin semantics
+ * can be confirmed against observed behavior; feeds presence as a fallback
+ * when the UART link has been silent for 5 s. */
+static void c1001_io_pins_poll(void)
+{
+    static int last_a = -1, last_b = -1;
+    int a = gpio_get_level(C1001_IO_PIN_A);
+    int b = gpio_get_level(C1001_IO_PIN_B);
+    if (a != last_a || b != last_b) {
+        ESP_LOGI(TAG, "C1001 IO pins: G%d=%d G%d=%d",
+                 C1001_IO_PIN_A, a, C1001_IO_PIN_B, b);
+        last_a = a; last_b = b;
+    }
+    int64_t uart_age_us = esp_timer_get_time() - s_state.last_update_us;
+    if (uart_age_us > 5 * 1000 * 1000) {
+        s_state.person_present = (a != 0) || (b != 0);
+    }
+}
+#endif /* CONFIG_DISPLAY_STICKS3 */
 
 static mmwave_type_t probe_all_pinsets(void)
 {
@@ -694,7 +740,13 @@ static void mmwave_retry_task(void *arg)
 {
     (void)arg;
     for (int round = 0; round < 3 && s_running; round++) {
-        vTaskDelay(pdMS_TO_TICKS(12000));
+        /* Wait ~12 s between rounds, watching the radar IO pins meanwhile. */
+        for (int t = 0; t < 60 && s_running; t++) {
+#if CONFIG_DISPLAY_STICKS3
+            c1001_io_pins_poll();
+#endif
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
         mmwave_type_t detected = probe_all_pinsets();
         if (detected != MMWAVE_TYPE_NONE) {
             ESP_LOGI(TAG, "Deferred probe round %d found a sensor", round + 1);
@@ -703,8 +755,27 @@ static void mmwave_retry_task(void *arg)
             return;
         }
     }
-    ESP_LOGI(TAG, "Deferred probes exhausted — no mmWave sensor");
+    ESP_LOGI(TAG, "Deferred probes exhausted — no mmWave sensor on UART");
     uart_driver_delete(MMWAVE_UART_NUM);
+
+#if CONFIG_DISPLAY_STICKS3
+    /* UART dead but the radar's hardware presence outputs may still work.
+     * Watch G5/G7: first activity switches us into GPIO-only presence mode. */
+    ESP_LOGI(TAG, "Monitoring C1001 IO pins (G%d/G%d) for GPIO-only presence",
+             C1001_IO_PIN_A, C1001_IO_PIN_B);
+    bool announced = false;
+    while (s_running) {
+        c1001_io_pins_poll();
+        if (!announced && s_state.person_present) {
+            s_state.type = MMWAVE_TYPE_C1001;
+            s_state.detected = true;
+            s_state.capabilities = MMWAVE_CAP_PRESENCE;
+            ESP_LOGI(TAG, "C1001 GPIO-only presence mode active");
+            announced = true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+#endif
     vTaskDelete(NULL);
 }
 
@@ -752,22 +823,31 @@ esp_err_t mmwave_sensor_init(int uart_tx_pin, int uart_rx_pin)
     /* Candidate (TX, RX) pin pairs. On the StickS3 the sensor hangs off the
      * Grove PORT.A connector (G9/G10) with unknown orientation; other boards
      * use the legacy UART1 pins 17/18. Explicit pins override the list. */
-    int pin_sets[3][2];
+    int pin_sets[5][2];
     int n_pin_sets;
     if (uart_tx_pin >= 0 && uart_rx_pin >= 0) {
         pin_sets[0][0] = uart_tx_pin; pin_sets[0][1] = uart_rx_pin;
         n_pin_sets = 1;
     } else {
 #if CONFIG_DISPLAY_STICKS3
-        pin_sets[0][0] = 9;  pin_sets[0][1] = 10;
-        pin_sets[1][0] = 10; pin_sets[1][1] = 9;
-        pin_sets[2][0] = 17; pin_sets[2][1] = 18;
-        n_pin_sets = 3;
+        /* HAT header G43/G44 first (deployed C1001 wiring; console is on
+         * USB-Serial-JTAG so UART0's default pins are free), then Grove
+         * PORT.A, then the legacy devkit pins. */
+        pin_sets[0][0] = 43; pin_sets[0][1] = 44;
+        pin_sets[1][0] = 44; pin_sets[1][1] = 43;
+        pin_sets[2][0] = 9;  pin_sets[2][1] = 10;
+        pin_sets[3][0] = 10; pin_sets[3][1] = 9;
+        pin_sets[4][0] = 17; pin_sets[4][1] = 18;
+        n_pin_sets = 5;
 #else
         pin_sets[0][0] = 17; pin_sets[0][1] = 18;
         n_pin_sets = 1;
 #endif
     }
+
+#if CONFIG_DISPLAY_STICKS3
+    c1001_io_pins_init();
+#endif
 
     /* Install UART driver at MR60 baud (will be changed during probe). */
     uart_config_t uart_config = {
