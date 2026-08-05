@@ -1,0 +1,42 @@
+# M5Stack StickS3 (K150) CSI Node — SDK Configuration
+# ESP32-S3-PICO-1-N8R8: 8MB flash + 8MB octal PSRAM, ST7789 135x240 TFT.
+#
+# Usage: cp sdkconfig.defaults.sticks3 sdkconfig.defaults && idf.py set-target esp32s3 build
+# Note: keeps partitions_4mb.csv (dual 1.875MB OTA slots) to stay
+# OTA-compatible with boards already flashed with that table.
+
+# Target: ESP32-S3
+CONFIG_IDF_TARGET="esp32s3"
+
+# Partition table: dual-OTA (matches deployed StickS3 flash layout)
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_4mb.csv"
+
+# Flash: 8MB QIO
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="8MB"
+
+# PSRAM: 8MB octal @ 80MHz (LVGL draw buffers live here)
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y
+
+# Display: StickS3 ST7789 simple status UI (ADR-045 variant)
+CONFIG_DISPLAY_ENABLE=y
+CONFIG_DISPLAY_STICKS3=y
+CONFIG_DISPLAY_FPS_LIMIT=10
+CONFIG_DISPLAY_BRIGHTNESS=80
+
+# Compiler optimization: size
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+
+# WiFi CSI capture
+CONFIG_ESP_WIFI_CSI_ENABLED=y
+
+# Logging
+CONFIG_BOOTLOADER_LOG_LEVEL_WARN=y
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# LWIP: extended socket options
+CONFIG_LWIP_SO_RCVBUF=y

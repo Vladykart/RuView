@@ -23,30 +23,88 @@
 static const char *TAG = "disp_hal";
 
 /* ===========================================================================
- * ESP32-C6: ST7789 SPI TFT — Waveshare ESP32-C6-LCD-1.47 (172x320)
+ * ESP32-C6: 172x320 SPI TFT — Waveshare C6-LCD-1.47 variants
+ *
+ * Non-touch board (ESP32-C6-LCD-1.47):       4MB flash, ST7789
+ * Touch board (ESP32-C6-Touch-LCD-1.47):     8MB flash, JD9853
+ *
+ * Both use ST7789-compatible SPI command paths in ESP-IDF, but GPIO mappings
+ * differ. Select mapping at runtime from detected flash size.
  * =========================================================================*/
 #if CONFIG_IDF_TARGET_ESP32C6
 
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"  /* provides esp_lcd_new_panel_st7789() */
 #include "driver/ledc.h"
+#include "esp_flash.h"
 
-/* Pin assignments (Waveshare ESP32-C6-LCD-1.47) */
-#define ST_SCLK     7
-#define ST_MOSI     6
-#define ST_CS       14
-#define ST_DC       15
-#define ST_RST      21
-#define ST_BLK      22
+/* Non-touch pin assignments (ESP32-C6-LCD-1.47, 4MB) */
+#define C6_NT_SCLK     7
+#define C6_NT_MOSI     6
+#define C6_NT_CS       14
+#define C6_NT_DC       15
+#define C6_NT_RST      21
+#define C6_NT_BLK      22
 
-#define ST_H_RES    172
-#define ST_V_RES    320
+/* Touch pin assignments (ESP32-C6-Touch-LCD-1.47, 8MB) */
+#define C6_T_SCLK      1
+#define C6_T_MOSI      2
+#define C6_T_CS        14
+#define C6_T_DC        15
+#define C6_T_RST       22
+#define C6_T_BLK       23
+
+#define ST_H_RES       172
+#define ST_V_RES       320
 
 static esp_lcd_panel_handle_t s_panel = NULL;
+static int s_pin_sclk = C6_NT_SCLK;
+static int s_pin_mosi = C6_NT_MOSI;
+static int s_pin_cs = C6_NT_CS;
+static int s_pin_dc = C6_NT_DC;
+static int s_pin_rst = C6_NT_RST;
+static int s_pin_blk = C6_NT_BLK;
+static bool s_touch_variant = false;
+
+static void detect_c6_variant_and_pins(void)
+{
+    uint32_t flash_size = 0;
+    esp_err_t ret = esp_flash_get_size(NULL, &flash_size);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Flash size detect failed (%s), defaulting to non-touch pins",
+                 esp_err_to_name(ret));
+        flash_size = 0;
+    }
+
+    if (flash_size >= (8 * 1024 * 1024)) {
+        s_touch_variant = true;
+        s_pin_sclk = C6_T_SCLK;
+        s_pin_mosi = C6_T_MOSI;
+        s_pin_cs = C6_T_CS;
+        s_pin_dc = C6_T_DC;
+        s_pin_rst = C6_T_RST;
+        s_pin_blk = C6_T_BLK;
+        ESP_LOGI(TAG, "Detected touch board variant (8MB flash, JD9853)");
+    } else {
+        s_touch_variant = false;
+        s_pin_sclk = C6_NT_SCLK;
+        s_pin_mosi = C6_NT_MOSI;
+        s_pin_cs = C6_NT_CS;
+        s_pin_dc = C6_NT_DC;
+        s_pin_rst = C6_NT_RST;
+        s_pin_blk = C6_NT_BLK;
+        ESP_LOGI(TAG, "Detected non-touch board variant (<8MB flash, ST7789)");
+    }
+
+    ESP_LOGI(TAG, "LCD pins SCLK=%d MOSI=%d CS=%d DC=%d RST=%d BLK=%d",
+             s_pin_sclk, s_pin_mosi, s_pin_cs, s_pin_dc, s_pin_rst, s_pin_blk);
+}
 
 esp_err_t display_hal_init_panel(void)
 {
-    ESP_LOGI(TAG, "Initializing Waveshare C6-LCD-1.47 (ST7789 172x320)...");
+    detect_c6_variant_and_pins();
+    ESP_LOGI(TAG, "Initializing Waveshare C6%s-LCD-1.47 (172x320)...",
+             s_touch_variant ? "-Touch" : "");
 
     /* Backlight — turn on via LEDC PWM */
     ledc_timer_config_t bl_timer = {
@@ -59,7 +117,7 @@ esp_err_t display_hal_init_panel(void)
     ledc_timer_config(&bl_timer);
 
     ledc_channel_config_t bl_ch = {
-        .gpio_num = ST_BLK,
+        .gpio_num = s_pin_blk,
         .speed_mode = LEDC_LOW_SPEED_MODE,
         .channel = LEDC_CHANNEL_0,
         .timer_sel = LEDC_TIMER_0,
@@ -67,23 +125,23 @@ esp_err_t display_hal_init_panel(void)
         .hpoint = 0,
     };
     ledc_channel_config(&bl_ch);
-    ESP_LOGI(TAG, "Backlight ON (GPIO %d, PWM)", ST_BLK);
+    ESP_LOGI(TAG, "Backlight ON (GPIO %d, PWM)", s_pin_blk);
 
     /* Hardware reset */
     gpio_config_t rst_cfg = {
-        .pin_bit_mask = (1ULL << ST_RST),
+        .pin_bit_mask = (1ULL << s_pin_rst),
         .mode = GPIO_MODE_OUTPUT,
     };
     gpio_config(&rst_cfg);
-    gpio_set_level(ST_RST, 0);
+    gpio_set_level(s_pin_rst, 0);
     vTaskDelay(pdMS_TO_TICKS(100));
-    gpio_set_level(ST_RST, 1);
+    gpio_set_level(s_pin_rst, 1);
     vTaskDelay(pdMS_TO_TICKS(100));
 
     /* SPI bus */
     spi_bus_config_t bus_cfg = {
-        .sclk_io_num = ST_SCLK,
-        .mosi_io_num = ST_MOSI,
+        .sclk_io_num = s_pin_sclk,
+        .mosi_io_num = s_pin_mosi,
         .miso_io_num = -1,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
@@ -94,8 +152,8 @@ esp_err_t display_hal_init_panel(void)
     /* Panel IO */
     esp_lcd_panel_io_handle_t io_handle = NULL;
     esp_lcd_panel_io_spi_config_t io_config = {
-        .dc_gpio_num = ST_DC,
-        .cs_gpio_num = ST_CS,
+        .dc_gpio_num = s_pin_dc,
+        .cs_gpio_num = s_pin_cs,
         .pclk_hz = 40 * 1000 * 1000,
         .lcd_cmd_bits = 8,
         .lcd_param_bits = 8,
@@ -105,7 +163,7 @@ esp_err_t display_hal_init_panel(void)
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)SPI2_HOST,
                                              &io_config, &io_handle));
 
-    /* ST7789 panel driver */
+    /* ST7789-compatible panel driver */
     esp_lcd_panel_dev_config_t panel_config = {
         .reset_gpio_num = -1,  /* Already reset manually above */
         .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
@@ -116,13 +174,20 @@ esp_err_t display_hal_init_panel(void)
     ESP_ERROR_CHECK(esp_lcd_panel_reset(s_panel));
     ESP_ERROR_CHECK(esp_lcd_panel_init(s_panel));
 
-    /* ST7789 172x320: invert colors (required for this panel) and set orientation */
+    /* 172x320: invert colors and set column gap for 240-col controller space */
     ESP_ERROR_CHECK(esp_lcd_panel_invert_color(s_panel, true));
-    /* Portrait: 172 wide, 320 tall.  Offset for 172-column panel centered in 240-col controller. */
     ESP_ERROR_CHECK(esp_lcd_panel_set_gap(s_panel, 34, 0));
+
+    /* Touch variant has opposite default horizontal scan direction */
+    if (s_touch_variant) {
+        ESP_ERROR_CHECK(esp_lcd_panel_mirror(s_panel, true, false));
+    }
+
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel, true));
 
-    ESP_LOGI(TAG, "ST7789 panel init OK (%dx%d)", ST_H_RES, ST_V_RES);
+    ESP_LOGI(TAG, "Panel init OK (%dx%d, %s)", ST_H_RES, ST_V_RES,
+             s_touch_variant ? "touch/JD9853" : "non-touch/ST7789");
+
     return ESP_OK;
 }
 
@@ -153,7 +218,179 @@ void display_hal_set_brightness(uint8_t percent)
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
 }
 
-#else /* !CONFIG_IDF_TARGET_ESP32C6 — original S3 AMOLED path */
+#elif CONFIG_DISPLAY_STICKS3
+
+/* ===========================================================================
+ * M5Stack StickS3 (K150): ST7789 SPI TFT 135x240
+ *
+ * Pin profile per M5GFX 0.2.26 (commit 729297d6, src/M5GFX.cpp): SPI3
+ * mode 0 @ 40 MHz, gap (52,40), color inversion on, backlight GPIO38
+ * active-high plain GPIO (no PWM channel documented for K150).
+ * =========================================================================*/
+
+#include "esp_lcd_panel_ops.h"
+#include "esp_lcd_panel_vendor.h"
+#include "driver/i2c.h"
+
+#define S3S_SCLK       40
+#define S3S_MOSI       39
+#define S3S_CS         41
+#define S3S_DC         45
+#define S3S_RST        21
+#define S3S_BLK        38
+
+/* M5PM1 PMIC — gates the LCD power rail (M5GFX 0.2.26 board_M5StickS3) */
+#define S3S_I2C_PORT   I2C_NUM_1
+#define S3S_I2C_SDA    47
+#define S3S_I2C_SCL    48
+#define M5PM1_ADDR     0x6E
+
+#define ST_H_RES       135
+#define ST_V_RES       240
+
+static esp_lcd_panel_handle_t s_panel = NULL;
+
+static esp_err_t pm1_write_reg(uint8_t reg, uint8_t val)
+{
+    uint8_t buf[2] = { reg, val };
+    return i2c_master_write_to_device(S3S_I2C_PORT, M5PM1_ADDR, buf, 2,
+                                      pdMS_TO_TICKS(100));
+}
+
+static esp_err_t pm1_update_bit(uint8_t reg, uint8_t bit_mask, bool set)
+{
+    uint8_t val = 0;
+    esp_err_t err = i2c_master_write_read_device(S3S_I2C_PORT, M5PM1_ADDR,
+                                                 &reg, 1, &val, 1,
+                                                 pdMS_TO_TICKS(100));
+    if (err != ESP_OK) return err;
+    val = set ? (val | bit_mask) : (val & ~bit_mask);
+    return pm1_write_reg(reg, val);
+}
+
+/* Enable the LCD power rail via M5PM1 GPIO2 (register sequence from M5GFX) */
+static esp_err_t sticks3_lcd_power_on(void)
+{
+    i2c_config_t i2c_cfg = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = S3S_I2C_SDA,
+        .scl_io_num = S3S_I2C_SCL,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = 100000,
+    };
+    esp_err_t err = i2c_param_config(S3S_I2C_PORT, &i2c_cfg);
+    if (err == ESP_OK) err = i2c_driver_install(S3S_I2C_PORT, I2C_MODE_MASTER, 0, 0, 0);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "M5PM1 I2C init failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    /* Keep PMIC awake, then configure GPIO2 as push-pull output high */
+    pm1_write_reg(0x09, 0x00);            /* disable I2C idle sleep       */
+    pm1_update_bit(0x16, 1 << 2, false);
+    pm1_update_bit(0x10, 1 << 2, true);   /* GPIO2 output enable          */
+    pm1_update_bit(0x13, 1 << 2, false);
+    err = pm1_update_bit(0x11, 1 << 2, true);  /* GPIO2 high → LCD power  */
+    ESP_LOGI(TAG, "M5PM1 LCD power rail: %s", err == ESP_OK ? "ON" : "FAILED");
+    return err;
+}
+
+esp_err_t display_hal_init_panel(void)
+{
+    ESP_LOGI(TAG, "Initializing M5Stack StickS3 ST7789 (%dx%d)...", ST_H_RES, ST_V_RES);
+
+    /* LCD power rail must come up before the panel will respond */
+    sticks3_lcd_power_on();
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    /* Backlight on — plain GPIO, active high */
+    gpio_config_t blk_cfg = {
+        .pin_bit_mask = (1ULL << S3S_BLK),
+        .mode = GPIO_MODE_OUTPUT,
+    };
+    gpio_config(&blk_cfg);
+    gpio_set_level(S3S_BLK, 1);
+
+    /* Hardware reset */
+    gpio_config_t rst_cfg = {
+        .pin_bit_mask = (1ULL << S3S_RST),
+        .mode = GPIO_MODE_OUTPUT,
+    };
+    gpio_config(&rst_cfg);
+    gpio_set_level(S3S_RST, 0);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    gpio_set_level(S3S_RST, 1);
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    spi_bus_config_t bus_cfg = {
+        .sclk_io_num = S3S_SCLK,
+        .mosi_io_num = S3S_MOSI,
+        .miso_io_num = -1,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = ST_H_RES * 40 * 2,
+    };
+    ESP_ERROR_CHECK(spi_bus_initialize(SPI3_HOST, &bus_cfg, SPI_DMA_CH_AUTO));
+
+    esp_lcd_panel_io_handle_t io_handle = NULL;
+    esp_lcd_panel_io_spi_config_t io_config = {
+        .dc_gpio_num = S3S_DC,
+        .cs_gpio_num = S3S_CS,
+        .pclk_hz = 40 * 1000 * 1000,
+        .lcd_cmd_bits = 8,
+        .lcd_param_bits = 8,
+        .spi_mode = 0,
+        .trans_queue_depth = 10,
+    };
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)SPI3_HOST,
+                                             &io_config, &io_handle));
+
+    esp_lcd_panel_dev_config_t panel_config = {
+        .reset_gpio_num = -1,  /* Already reset manually above */
+        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
+        .bits_per_pixel = 16,
+    };
+    ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(io_handle, &panel_config, &s_panel));
+
+    ESP_ERROR_CHECK(esp_lcd_panel_reset(s_panel));
+    ESP_ERROR_CHECK(esp_lcd_panel_init(s_panel));
+
+    /* 135x240 window inside the 240x320 controller space */
+    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(s_panel, true));
+    ESP_ERROR_CHECK(esp_lcd_panel_set_gap(s_panel, 52, 40));
+
+    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel, true));
+
+    ESP_LOGI(TAG, "Panel init OK (StickS3 ST7789 %dx%d)", ST_H_RES, ST_V_RES);
+    return ESP_OK;
+}
+
+void display_hal_draw(int x_start, int y_start, int x_end, int y_end,
+                      const void *color_data)
+{
+    if (!s_panel) return;
+    esp_lcd_panel_draw_bitmap(s_panel, x_start, y_start, x_end, y_end, color_data);
+}
+
+esp_err_t display_hal_init_touch(void)
+{
+    ESP_LOGI(TAG, "No touch controller on StickS3");
+    return ESP_ERR_NOT_FOUND;
+}
+
+bool display_hal_touch_read(uint16_t *x, uint16_t *y)
+{
+    return false;
+}
+
+void display_hal_set_brightness(uint8_t percent)
+{
+    /* Plain GPIO backlight: on/off only */
+    gpio_set_level(S3S_BLK, percent > 0 ? 1 : 0);
+}
+
+#else /* original S3 AMOLED path */
 
 #include "driver/i2c.h"
 

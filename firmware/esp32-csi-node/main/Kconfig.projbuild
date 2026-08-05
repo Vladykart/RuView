@@ -98,6 +98,17 @@ menu "AMOLED Display (ADR-045)"
             Auto-detects at boot; gracefully skips if no display hardware.
             Requires SPIRAM for frame buffers.
 
+    config DISPLAY_STICKS3
+        bool "M5Stack StickS3 (K150) ST7789 135x240 panel"
+        default n
+        depends on DISPLAY_ENABLE && IDF_TARGET_ESP32S3
+        help
+            Drive the M5Stack StickS3 integrated ST7789 SPI TFT (135x240)
+            instead of the Waveshare QSPI AMOLED. Pin profile follows
+            M5GFX 0.2.26: SPI3 mode 0 @ 40 MHz, MOSI=39, SCLK=40, DC=45,
+            CS=41, RST=21, backlight GPIO38 active-high, gap (52,40),
+            color inversion on.
+
     config DISPLAY_FPS_LIMIT
         int "Display refresh rate limit (FPS)"
         default 30

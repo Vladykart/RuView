@@ -20,10 +20,14 @@
 
 #include "display_hal.h"
 #include "display_ui.h"
+#include "esp_timer.h"
 
 #if CONFIG_IDF_TARGET_ESP32C6
 #define DISP_H_RES  172
 #define DISP_V_RES  320
+#elif CONFIG_DISPLAY_STICKS3
+#define DISP_H_RES  135
+#define DISP_V_RES  240
 #else
 #define DISP_H_RES  368
 #define DISP_V_RES  448
@@ -74,8 +78,27 @@ static void display_task(void *arg)
 
     display_ui_create(lv_scr_act());
 
+    /* Force initial render: seed LVGL tick so the refresh timer
+     * fires on the very first lv_timer_handler() call. Without
+     * this, tick=0 means the 30ms refresh period hasn't elapsed
+     * and the screen stays black until the second iteration. */
+    lv_tick_inc(50);
+    lv_timer_handler();
+
+    int64_t prev_us = esp_timer_get_time();
     TickType_t last_wake = xTaskGetTickCount();
     while (1) {
+        /* Advance LVGL tick — required for screen refresh scheduling.
+         * CONFIG_LV_TICK_CUSTOM is not set (Kconfig lacks the
+         * SYS_TIME_EXPR entry for ESP-IDF), so we feed the tick
+         * manually from esp_timer. */
+        int64_t now_us = esp_timer_get_time();
+        uint32_t elapsed_ms = (uint32_t)((now_us - prev_us) / 1000);
+        if (elapsed_ms > 0) {
+            lv_tick_inc(elapsed_ms);
+            prev_us = now_us;
+        }
+
         display_ui_update();
         lv_timer_handler();
         vTaskDelayUntil(&last_wake, frame_period);

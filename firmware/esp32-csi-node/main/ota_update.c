@@ -24,7 +24,7 @@ static const char *TAG = "ota_update";
 #define OTA_PORT 8032
 
 /** Maximum firmware size (900 KB — matches CI binary size gate). */
-#define OTA_MAX_SIZE (900 * 1024)
+#define OTA_MAX_SIZE 0x1D0000  /* full OTA slot size (partitions_4mb.csv) */
 
 /** NVS namespace and key for the OTA pre-shared key. */
 #define OTA_NVS_NAMESPACE "security"

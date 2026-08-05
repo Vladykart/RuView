@@ -38,10 +38,123 @@ static const char *TAG = "disp_ui";
 #if CONFIG_IDF_TARGET_ESP32C6
 #define SCR_W  172
 #define SCR_H  320
+#elif CONFIG_DISPLAY_STICKS3
+#define SCR_W  135
+#define SCR_H  240
 #else
 #define SCR_W  368
 #define SCR_H  448
 #endif
+
+#if CONFIG_DISPLAY_STICKS3
+/* ===========================================================================
+ * StickS3 simple status UI — one screen, essentials only, no charts.
+ *
+ * The full 4-view dashboard starves CPU0 on this board (task_wdt) and is
+ * unreadable at 135x240 anyway. Show the most important information plus
+ * enough setup info (IP, OTA port) to find and manage the node.
+ * =========================================================================*/
+
+#include "esp_netif.h"
+
+static lv_obj_t *s_lbl_title    = NULL;
+static lv_obj_t *s_lbl_net      = NULL;
+static lv_obj_t *s_lbl_srv      = NULL;
+static lv_obj_t *s_lbl_rssi     = NULL;
+static lv_obj_t *s_lbl_presence = NULL;
+static lv_obj_t *s_lbl_breath   = NULL;
+static lv_obj_t *s_lbl_heart    = NULL;
+static lv_obj_t *s_lbl_foot     = NULL;
+
+static lv_obj_t *mk_line(lv_obj_t *parent, int y, lv_color_t color)
+{
+    lv_obj_t *lbl = lv_label_create(parent);
+    lv_label_set_text(lbl, "--");
+    lv_obj_set_style_text_color(lbl, color, 0);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+    lv_label_set_long_mode(lbl, LV_LABEL_LONG_CLIP);
+    lv_obj_set_width(lbl, SCR_W - 8);
+    lv_obj_set_pos(lbl, 4, y);
+    return lbl;
+}
+
+void display_ui_create(lv_obj_t *parent)
+{
+    lv_obj_set_style_bg_color(parent, COLOR_BG, 0);
+    lv_obj_set_style_bg_opa(parent, LV_OPA_COVER, 0);
+
+    char title[24];
+    snprintf(title, sizeof(title), "RuView N%d", g_nvs_config.node_id);
+    s_lbl_title = mk_line(parent, 6, COLOR_CYAN);
+    lv_label_set_text(s_lbl_title, title);
+
+    s_lbl_net      = mk_line(parent, 34,  COLOR_TEXT);
+    s_lbl_srv      = mk_line(parent, 56,  COLOR_TEXT_DIM);
+    s_lbl_rssi     = mk_line(parent, 84,  COLOR_TEXT);
+    s_lbl_presence = mk_line(parent, 112, COLOR_GREEN);
+    s_lbl_breath   = mk_line(parent, 140, COLOR_CYAN);
+    s_lbl_heart    = mk_line(parent, 162, COLOR_AMBER);
+    s_lbl_foot     = mk_line(parent, SCR_H - 22, COLOR_TEXT_DIM);
+
+    ESP_LOGI(TAG, "UI created: StickS3 simple status view");
+}
+
+void display_ui_update(void)
+{
+    /* Refresh labels at 2 Hz — rendering stays cheap between updates */
+    static uint32_t s_last_ms = 0;
+    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    if (now_ms - s_last_ms < 500) return;
+    s_last_ms = now_ms;
+
+    char buf[40];
+
+    /* Network state — this doubles as the setup screen */
+    esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    esp_netif_ip_info_t ip = {0};
+    bool has_ip = sta && esp_netif_get_ip_info(sta, &ip) == ESP_OK
+                  && ip.ip.addr != 0;
+
+    if (g_nvs_config.wifi_ssid[0] == '\0') {
+        lv_label_set_text(s_lbl_net, "SETUP: provision");
+        lv_label_set_text(s_lbl_srv, "via USB (provision.py)");
+    } else if (!has_ip) {
+        snprintf(buf, sizeof(buf), "WiFi: joining...");
+        lv_label_set_text(s_lbl_net, buf);
+        lv_label_set_text(s_lbl_srv, g_nvs_config.wifi_ssid);
+    } else {
+        snprintf(buf, sizeof(buf), "IP " IPSTR, IP2STR(&ip.ip));
+        lv_label_set_text(s_lbl_net, buf);
+        snprintf(buf, sizeof(buf), "> %s:%u", g_nvs_config.target_ip,
+                 (unsigned)g_nvs_config.target_port);
+        lv_label_set_text(s_lbl_srv, buf);
+    }
+
+    edge_vitals_pkt_t vitals;
+    if (edge_get_vitals(&vitals)) {
+        snprintf(buf, sizeof(buf), "RSSI %d dBm", vitals.rssi);
+        lv_label_set_text(s_lbl_rssi, buf);
+
+        bool present = (vitals.flags & 0x01) || vitals.n_persons > 0;
+        snprintf(buf, sizeof(buf), "%s (%u)",
+                 present ? "PRESENCE" : "empty", vitals.n_persons);
+        lv_label_set_text(s_lbl_presence, buf);
+        lv_obj_set_style_text_color(s_lbl_presence,
+                                    present ? COLOR_GREEN : COLOR_TEXT_DIM, 0);
+
+        snprintf(buf, sizeof(buf), "BR %d bpm", (int)(vitals.breathing_rate / 100));
+        lv_label_set_text(s_lbl_breath, buf);
+        snprintf(buf, sizeof(buf), "HR %d bpm", (int)(vitals.heartrate / 10000));
+        lv_label_set_text(s_lbl_heart, buf);
+    }
+
+    uint32_t up_s = now_ms / 1000;
+    snprintf(buf, sizeof(buf), "OTA:8032  up %lum",
+             (unsigned long)(up_s / 60));
+    lv_label_set_text(s_lbl_foot, buf);
+}
+
+#else /* !CONFIG_DISPLAY_STICKS3 — full 4-view dashboard */
 
 /* ---- Chart data points ---- */
 #define CHART_POINTS    60
@@ -384,5 +497,7 @@ void display_ui_update(void)
         lv_label_set_text(s_sys_fps, buf);
     }
 }
+
+#endif /* CONFIG_DISPLAY_STICKS3 */
 
 #endif /* CONFIG_DISPLAY_ENABLE */
