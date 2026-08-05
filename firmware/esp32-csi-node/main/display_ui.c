@@ -57,24 +57,55 @@ static const char *TAG = "disp_ui";
 
 #include "esp_netif.h"
 
-static lv_obj_t *s_lbl_title    = NULL;
-static lv_obj_t *s_lbl_net      = NULL;
-static lv_obj_t *s_lbl_srv      = NULL;
-static lv_obj_t *s_lbl_rssi     = NULL;
-static lv_obj_t *s_lbl_presence = NULL;
-static lv_obj_t *s_lbl_breath   = NULL;
-static lv_obj_t *s_lbl_heart    = NULL;
-static lv_obj_t *s_lbl_foot     = NULL;
+/* Card / accent palette (matches the approved 135x240 mock) */
+#define CARD_BG      lv_color_make(0x12, 0x12, 0x1A)
+#define CARD_BORDER  lv_color_make(0x26, 0x26, 0x36)
+#define BAR_OFF      lv_color_make(0x30, 0x30, 0x40)
 
-static lv_obj_t *mk_line(lv_obj_t *parent, int y, lv_color_t color)
+/* Layout grid */
+#define PAD          6
+#define CARD_W       (SCR_W - 2 * PAD)           /* 123 */
+#define VCARD_W      ((SCR_W - 2 * PAD - 5) / 2) /* 59  */
+
+static lv_obj_t *s_hero_card    = NULL;
+static lv_obj_t *s_lbl_state    = NULL;   /* OCCUPIED / EMPTY / joining */
+static lv_obj_t *s_lbl_substate = NULL;   /* "1 person" / "watching"    */
+static lv_obj_t *s_lbl_br_val   = NULL;
+static lv_obj_t *s_lbl_hr_val   = NULL;
+static lv_obj_t *s_lbl_rssi     = NULL;
+static lv_obj_t *s_lbl_ip       = NULL;
+static lv_obj_t *s_lbl_target   = NULL;
+static lv_obj_t *s_lbl_uptime   = NULL;
+static lv_obj_t *s_wifi_bars[4] = {NULL};
+
+static lv_obj_t *mk_card(lv_obj_t *parent, int x, int y, int w, int h)
+{
+    lv_obj_t *card = lv_obj_create(parent);
+    lv_obj_set_pos(card, x, y);
+    lv_obj_set_size(card, w, h);
+    lv_obj_set_style_bg_color(card, CARD_BG, 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(card, CARD_BORDER, 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_radius(card, 8, 0);
+    lv_obj_set_style_pad_all(card, 0, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(card, LV_SCROLLBAR_MODE_OFF);
+    return card;
+}
+
+static lv_obj_t *mk_text(lv_obj_t *parent, int x, int y, int w,
+                         const lv_font_t *font, lv_color_t color,
+                         lv_text_align_t align, const char *text)
 {
     lv_obj_t *lbl = lv_label_create(parent);
-    lv_label_set_text(lbl, "--");
+    lv_label_set_text(lbl, text);
+    lv_obj_set_style_text_font(lbl, font, 0);
     lv_obj_set_style_text_color(lbl, color, 0);
-    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_align(lbl, align, 0);
     lv_label_set_long_mode(lbl, LV_LABEL_LONG_CLIP);
-    lv_obj_set_width(lbl, SCR_W - 8);
-    lv_obj_set_pos(lbl, 4, y);
+    lv_obj_set_width(lbl, w);
+    lv_obj_set_pos(lbl, x, y);
     return lbl;
 }
 
@@ -82,26 +113,81 @@ void display_ui_create(lv_obj_t *parent)
 {
     lv_obj_set_style_bg_color(parent, COLOR_BG, 0);
     lv_obj_set_style_bg_opa(parent, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(parent, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(parent, LV_SCROLLBAR_MODE_OFF);
 
-    char title[24];
-    snprintf(title, sizeof(title), "RuView N%d", g_nvs_config.node_id);
-    s_lbl_title = mk_line(parent, 6, COLOR_CYAN);
-    lv_label_set_text(s_lbl_title, title);
+    /* ---- Header: brand + node id, hairline below ---- */
+    mk_text(parent, PAD + 2, 7, 80, &lv_font_montserrat_14, COLOR_CYAN,
+            LV_TEXT_ALIGN_LEFT, "RuView");
+    char node[8];
+    snprintf(node, sizeof(node), "N%d", g_nvs_config.node_id);
+    mk_text(parent, SCR_W - PAD - 34, 9, 32, &lv_font_montserrat_12,
+            COLOR_TEXT_DIM, LV_TEXT_ALIGN_RIGHT, node);
+    lv_obj_t *rule = lv_obj_create(parent);
+    lv_obj_set_pos(rule, PAD + 2, 26);
+    lv_obj_set_size(rule, CARD_W - 4, 1);
+    lv_obj_set_style_bg_color(rule, CARD_BORDER, 0);
+    lv_obj_set_style_bg_opa(rule, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(rule, 0, 0);
+    lv_obj_set_style_radius(rule, 0, 0);
 
-    s_lbl_net      = mk_line(parent, 34,  COLOR_TEXT);
-    s_lbl_srv      = mk_line(parent, 56,  COLOR_TEXT_DIM);
-    s_lbl_rssi     = mk_line(parent, 84,  COLOR_TEXT);
-    s_lbl_presence = mk_line(parent, 112, COLOR_GREEN);
-    s_lbl_breath   = mk_line(parent, 140, COLOR_CYAN);
-    s_lbl_heart    = mk_line(parent, 162, COLOR_AMBER);
-    s_lbl_foot     = mk_line(parent, SCR_H - 22, COLOR_TEXT_DIM);
+    /* ---- Hero: room presence ---- */
+    s_hero_card = mk_card(parent, PAD, 33, CARD_W, 58);
+    mk_text(parent, 0, 41, SCR_W, &lv_font_montserrat_12, COLOR_TEXT_DIM,
+            LV_TEXT_ALIGN_CENTER, "ROOM");
+    s_lbl_state = mk_text(parent, 0, 57, SCR_W, &lv_font_montserrat_20,
+                          COLOR_TEXT_DIM, LV_TEXT_ALIGN_CENTER, "...");
+    s_lbl_substate = mk_text(parent, 0, 78, SCR_W, &lv_font_montserrat_12,
+                             COLOR_TEXT_DIM, LV_TEXT_ALIGN_CENTER, "starting");
 
-    ESP_LOGI(TAG, "UI created: StickS3 simple status view");
+    /* ---- Vitals: breathing + heart rate cards ---- */
+    int vx2 = PAD + VCARD_W + 5;
+    mk_card(parent, PAD, 97, VCARD_W, 64);
+    mk_card(parent, vx2, 97, VCARD_W, 64);
+    mk_text(parent, PAD, 104, VCARD_W, &lv_font_montserrat_12, COLOR_CYAN,
+            LV_TEXT_ALIGN_CENTER, "BR");
+    s_lbl_br_val = mk_text(parent, PAD, 118, VCARD_W, &lv_font_montserrat_28,
+                           COLOR_TEXT, LV_TEXT_ALIGN_CENTER, "--");
+    mk_text(parent, PAD, 148, VCARD_W, &lv_font_montserrat_12, COLOR_TEXT_DIM,
+            LV_TEXT_ALIGN_CENTER, "bpm");
+    mk_text(parent, vx2, 104, VCARD_W, &lv_font_montserrat_12, COLOR_AMBER,
+            LV_TEXT_ALIGN_CENTER, "HR");
+    s_lbl_hr_val = mk_text(parent, vx2, 118, VCARD_W, &lv_font_montserrat_28,
+                           COLOR_TEXT, LV_TEXT_ALIGN_CENTER, "--");
+    mk_text(parent, vx2, 148, VCARD_W, &lv_font_montserrat_12, COLOR_TEXT_DIM,
+            LV_TEXT_ALIGN_CENTER, "bpm");
+
+    /* ---- Network card: WiFi bars + RSSI + IP ---- */
+    mk_card(parent, PAD, 167, CARD_W, 46);
+    static const int bar_h[4] = {4, 7, 10, 13};
+    for (int i = 0; i < 4; i++) {
+        s_wifi_bars[i] = lv_obj_create(parent);
+        lv_obj_set_pos(s_wifi_bars[i], 14 + i * 6, 188 - bar_h[i]);
+        lv_obj_set_size(s_wifi_bars[i], 4, bar_h[i]);
+        lv_obj_set_style_bg_color(s_wifi_bars[i], BAR_OFF, 0);
+        lv_obj_set_style_bg_opa(s_wifi_bars[i], LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(s_wifi_bars[i], 0, 0);
+        lv_obj_set_style_radius(s_wifi_bars[i], 1, 0);
+    }
+    s_lbl_rssi = mk_text(parent, 44, 176, CARD_W - 44, &lv_font_montserrat_14,
+                         COLOR_TEXT, LV_TEXT_ALIGN_LEFT, "--");
+    s_lbl_ip = mk_text(parent, 14, 196, CARD_W - 16, &lv_font_montserrat_12,
+                       COLOR_TEXT_DIM, LV_TEXT_ALIGN_LEFT, "no network");
+
+    /* ---- Footer: stream target + uptime ---- */
+    s_lbl_target = mk_text(parent, PAD + 2, SCR_H - 18, 84,
+                           &lv_font_montserrat_12, COLOR_TEXT_DIM,
+                           LV_TEXT_ALIGN_LEFT, "");
+    s_lbl_uptime = mk_text(parent, SCR_W - PAD - 44, SCR_H - 18, 42,
+                           &lv_font_montserrat_12, COLOR_TEXT_DIM,
+                           LV_TEXT_ALIGN_RIGHT, "");
+
+    ESP_LOGI(TAG, "UI created: StickS3 card status view");
 }
 
 void display_ui_update(void)
 {
-    /* Refresh labels at 2 Hz — rendering stays cheap between updates */
+    /* Refresh at 2 Hz — rendering stays cheap between updates */
     static uint32_t s_last_ms = 0;
     uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
     if (now_ms - s_last_ms < 500) return;
@@ -109,49 +195,98 @@ void display_ui_update(void)
 
     char buf[40];
 
-    /* Network state — this doubles as the setup screen */
+    /* Network state — the IP line doubles as the setup hint */
     esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     esp_netif_ip_info_t ip = {0};
     bool has_ip = sta && esp_netif_get_ip_info(sta, &ip) == ESP_OK
                   && ip.ip.addr != 0;
 
     if (g_nvs_config.wifi_ssid[0] == '\0') {
-        lv_label_set_text(s_lbl_net, "SETUP: provision");
-        lv_label_set_text(s_lbl_srv, "via USB (provision.py)");
+        lv_label_set_text(s_lbl_ip, "SETUP: provision.py");
     } else if (!has_ip) {
-        snprintf(buf, sizeof(buf), "WiFi: joining...");
-        lv_label_set_text(s_lbl_net, buf);
-        lv_label_set_text(s_lbl_srv, g_nvs_config.wifi_ssid);
+        lv_label_set_text(s_lbl_ip, "joining WiFi...");
     } else {
-        snprintf(buf, sizeof(buf), "IP " IPSTR, IP2STR(&ip.ip));
-        lv_label_set_text(s_lbl_net, buf);
-        snprintf(buf, sizeof(buf), "> %s:%u", g_nvs_config.target_ip,
-                 (unsigned)g_nvs_config.target_port);
-        lv_label_set_text(s_lbl_srv, buf);
+        snprintf(buf, sizeof(buf), IPSTR, IP2STR(&ip.ip));
+        lv_label_set_text(s_lbl_ip, buf);
     }
+
+    /* Stream target, shortened to the tail of the IP */
+    const char *tail = strrchr(g_nvs_config.target_ip, '.');
+    snprintf(buf, sizeof(buf), LV_SYMBOL_PLAY " %s:%u",
+             tail ? tail : g_nvs_config.target_ip,
+             (unsigned)g_nvs_config.target_port);
+    lv_label_set_text(s_lbl_target, buf);
 
     edge_vitals_pkt_t vitals;
-    if (edge_get_vitals(&vitals)) {
-        snprintf(buf, sizeof(buf), "RSSI %d dBm", vitals.rssi);
-        lv_label_set_text(s_lbl_rssi, buf);
+    bool has_vitals = edge_get_vitals(&vitals);
 
+    /* ---- Hero presence state ---- */
+    if (!has_ip && g_nvs_config.wifi_ssid[0] != '\0') {
+        lv_label_set_text(s_lbl_state, "JOINING");
+        lv_obj_set_style_text_color(s_lbl_state, COLOR_AMBER, 0);
+        lv_label_set_text(s_lbl_substate, g_nvs_config.wifi_ssid);
+        lv_obj_set_style_border_color(s_hero_card, CARD_BORDER, 0);
+    } else if (has_vitals) {
         bool present = (vitals.flags & 0x01) || vitals.n_persons > 0;
-        snprintf(buf, sizeof(buf), "%s (%u)",
-                 present ? "PRESENCE" : "empty", vitals.n_persons);
-        lv_label_set_text(s_lbl_presence, buf);
-        lv_obj_set_style_text_color(s_lbl_presence,
-                                    present ? COLOR_GREEN : COLOR_TEXT_DIM, 0);
-
-        snprintf(buf, sizeof(buf), "BR %d bpm", (int)(vitals.breathing_rate / 100));
-        lv_label_set_text(s_lbl_breath, buf);
-        snprintf(buf, sizeof(buf), "HR %d bpm", (int)(vitals.heartrate / 10000));
-        lv_label_set_text(s_lbl_heart, buf);
+        if (present) {
+            lv_label_set_text(s_lbl_state, "OCCUPIED");
+            lv_obj_set_style_text_color(s_lbl_state, COLOR_GREEN, 0);
+            lv_obj_set_style_border_color(s_hero_card, COLOR_GREEN, 0);
+            if (vitals.n_persons > 1)
+                snprintf(buf, sizeof(buf), "%u persons", vitals.n_persons);
+            else
+                snprintf(buf, sizeof(buf), "1 person");
+            lv_label_set_text(s_lbl_substate, buf);
+            lv_obj_set_style_text_color(s_lbl_substate, COLOR_GREEN, 0);
+        } else {
+            lv_label_set_text(s_lbl_state, "EMPTY");
+            lv_obj_set_style_text_color(s_lbl_state, COLOR_TEXT_DIM, 0);
+            lv_obj_set_style_border_color(s_hero_card, CARD_BORDER, 0);
+            lv_label_set_text(s_lbl_substate, "watching");
+            lv_obj_set_style_text_color(s_lbl_substate, COLOR_TEXT_DIM, 0);
+        }
     }
 
-    uint32_t up_s = now_ms / 1000;
-    snprintf(buf, sizeof(buf), "OTA:8032  up %lum",
-             (unsigned long)(up_s / 60));
-    lv_label_set_text(s_lbl_foot, buf);
+    /* ---- Vitals ---- */
+    if (has_vitals) {
+        bool present = (vitals.flags & 0x01) || vitals.n_persons > 0;
+        int br = (int)(vitals.breathing_rate / 100);
+        int hr = (int)(vitals.heartrate / 10000);
+        if (present && br > 0) {
+            snprintf(buf, sizeof(buf), "%d", br);
+            lv_label_set_text(s_lbl_br_val, buf);
+            lv_obj_set_style_text_color(s_lbl_br_val, COLOR_TEXT, 0);
+        } else {
+            lv_label_set_text(s_lbl_br_val, "--");
+            lv_obj_set_style_text_color(s_lbl_br_val, COLOR_TEXT_DIM, 0);
+        }
+        if (present && hr > 0) {
+            snprintf(buf, sizeof(buf), "%d", hr);
+            lv_label_set_text(s_lbl_hr_val, buf);
+            lv_obj_set_style_text_color(s_lbl_hr_val, COLOR_TEXT, 0);
+        } else {
+            lv_label_set_text(s_lbl_hr_val, "--");
+            lv_obj_set_style_text_color(s_lbl_hr_val, COLOR_TEXT_DIM, 0);
+        }
+
+        /* ---- Signal bars + RSSI ---- */
+        snprintf(buf, sizeof(buf), "%d dBm", vitals.rssi);
+        lv_label_set_text(s_lbl_rssi, buf);
+        static const int thresh[4] = {-85, -75, -65, -55};
+        for (int i = 0; i < 4; i++) {
+            lv_obj_set_style_bg_color(s_wifi_bars[i],
+                vitals.rssi >= thresh[i] ? COLOR_CYAN : BAR_OFF, 0);
+        }
+    }
+
+    /* ---- Uptime ---- */
+    uint32_t up_min = now_ms / 60000;
+    if (up_min < 60)
+        snprintf(buf, sizeof(buf), "%lum", (unsigned long)up_min);
+    else
+        snprintf(buf, sizeof(buf), "%luh%02lu", (unsigned long)(up_min / 60),
+                 (unsigned long)(up_min % 60));
+    lv_label_set_text(s_lbl_uptime, buf);
 }
 
 #else /* !CONFIG_DISPLAY_STICKS3 — full 4-view dashboard */

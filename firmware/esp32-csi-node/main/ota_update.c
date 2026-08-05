@@ -113,7 +113,7 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
 
     if (req->content_len <= 0 || req->content_len > OTA_MAX_SIZE) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                            "Invalid firmware size (must be 1B - 900KB)");
+                            "Invalid firmware size (exceeds OTA slot)");
         return ESP_FAIL;
     }
 
@@ -207,6 +207,10 @@ static esp_err_t ota_start_server(httpd_handle_t *out_handle)
     config.max_uri_handlers = 12;  /* Extra slots for WASM endpoints (ADR-040). */
     /* Increase receive timeout for large uploads. */
     config.recv_wait_timeout = 30;
+    /* esp_ota_end() runs esp_image_verify() on this task; the default 4KB
+     * stack overflows during the SHA-256 read-back (corrupted-backtrace
+     * panic at ~95% upload). */
+    config.stack_size = 10240;
 
     httpd_handle_t server = NULL;
     esp_err_t err = httpd_start(&server, &config);
