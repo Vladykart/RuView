@@ -559,12 +559,13 @@ static void send_vitals_packet(void)
     pkt.heartrate = (uint32_t)(s_heartrate_bpm * 10000.0f);
     pkt.rssi = s_latest_rssi;
 
-    /* Count active persons. */
-    uint8_t n_active = 0;
-    for (uint8_t p = 0; p < EDGE_MAX_PERSONS; p++) {
-        if (s_persons[p].active) n_active++;
-    }
-    pkt.n_persons = n_active;
+    /* Person count: the subcarrier groups in s_persons are analysis
+     * channels, not detections — with top_k=8 they made n_persons a
+     * constant 4. A single node cannot separate people spatially
+     * (that's the ADR-065 mesh's job), so report the honest estimate:
+     * presence-gated 0 or 1, or the mmWave target count when a radar
+     * with multi-target capability is fused in (bit3 path below). */
+    pkt.n_persons = s_presence_detected ? 1 : 0;
 
     pkt.motion_energy = s_motion_energy;
     pkt.presence_score = s_presence_score;
@@ -585,7 +586,8 @@ static void send_vitals_packet(void)
         fpkt.flags = pkt.flags;
         if (mw.person_present) fpkt.flags |= 0x08;  /* Bit3 = mmwave_present */
         fpkt.rssi = pkt.rssi;
-        fpkt.n_persons = pkt.n_persons;
+        /* Radar target count beats the CSI presence-gated estimate. */
+        fpkt.n_persons = (mw.target_count > 0) ? mw.target_count : pkt.n_persons;
         fpkt.mmwave_type = (uint8_t)mw.type;
         fpkt.motion_energy = pkt.motion_energy;
         fpkt.presence_score = pkt.presence_score;

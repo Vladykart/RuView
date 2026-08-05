@@ -559,6 +559,15 @@ static mmwave_type_t probe_c1001(void)
         int64_t deadline = esp_timer_get_time() + 500 * 1000;
         while (esp_timer_get_time() < deadline) {
             int len = uart_read_bytes(MMWAVE_UART_NUM, buf, sizeof(buf), pdMS_TO_TICKS(50));
+            if (len > 0) {
+                /* Any bytes at all are diagnostic gold: garbled bytes mean
+                 * wrong baud or noise; a clean 0x53 0x59 means C1001. */
+                char hex[3 * 16 + 1] = {0};
+                int n = len < 16 ? len : 16;
+                for (int i = 0; i < n; i++)
+                    snprintf(hex + i * 3, 4, "%02X ", buf[i]);
+                ESP_LOGI(TAG, "C1001 probe RX %d bytes: %s", len, hex);
+            }
             for (int i = 0; i + 1 < len; i++) {
                 if (buf[i] == C1001_HDR0 && buf[i + 1] == C1001_HDR1) {
                     return MMWAVE_TYPE_C1001;
@@ -650,8 +659,28 @@ static int s_n_pin_sets;
 #define C1001_IO_PIN_A  5
 #define C1001_IO_PIN_B  7
 
+/* Electrical diagnosis: a pin actively driven by the radar holds its level
+ * regardless of our pull; a floating (unconnected) pin follows the pull. */
+static void c1001_io_pin_diagnose(int pin)
+{
+    gpio_set_direction(pin, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(pin, GPIO_PULLDOWN_ONLY);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    int with_down = gpio_get_level(pin);
+    gpio_set_pull_mode(pin, GPIO_PULLUP_ONLY);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    int with_up = gpio_get_level(pin);
+    const char *verdict = (with_down == with_up)
+        ? (with_down ? "DRIVEN HIGH" : "DRIVEN LOW")
+        : "FLOATING (not connected?)";
+    ESP_LOGI(TAG, "C1001 IO G%d: pulldown=%d pullup=%d -> %s",
+             pin, with_down, with_up, verdict);
+}
+
 static void c1001_io_pins_init(void)
 {
+    c1001_io_pin_diagnose(C1001_IO_PIN_A);
+    c1001_io_pin_diagnose(C1001_IO_PIN_B);
     gpio_config_t io_cfg = {
         .pin_bit_mask = (1ULL << C1001_IO_PIN_A) | (1ULL << C1001_IO_PIN_B),
         .mode = GPIO_MODE_INPUT,

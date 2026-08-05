@@ -17,6 +17,7 @@
 #include "esp_app_desc.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "mmwave_sensor.h"
 
 static const char *TAG = "ota_update";
 
@@ -81,15 +82,23 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
     const esp_partition_t *running = esp_ota_get_running_partition();
     const esp_partition_t *update = esp_ota_get_next_update_partition(NULL);
 
+    /* mmWave state — lets headless nodes report sensor detection remotely. */
+    mmwave_state_t mw;
+    bool has_mw = mmwave_sensor_get_state(&mw);
+
     char response[512];
     int len = snprintf(response, sizeof(response),
         "{\"version\":\"%s\",\"date\":\"%s\",\"time\":\"%s\","
         "\"running_partition\":\"%s\",\"next_partition\":\"%s\","
-        "\"max_size\":%d}",
+        "\"max_size\":%d,"
+        "\"mmwave\":\"%s\",\"mmwave_present\":%s,\"mmwave_frames\":%lu}",
         app->version, app->date, app->time,
         running ? running->label : "unknown",
         update ? update->label : "none",
-        OTA_MAX_SIZE);
+        OTA_MAX_SIZE,
+        has_mw ? mmwave_type_name(mw.type) : "none",
+        (has_mw && mw.person_present) ? "true" : "false",
+        (unsigned long)(has_mw ? mw.frame_count : 0));
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, response, len);
