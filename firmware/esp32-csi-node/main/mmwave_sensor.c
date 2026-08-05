@@ -88,6 +88,28 @@ static const char *TAG = "mmwave";
 static mmwave_state_t s_state;
 static volatile bool s_running;
 
+/* Diagnostic transcript kept in RAM so headless nodes can serve it
+ * remotely (GET /ota/diag). */
+static char s_diag_buf[512];
+static size_t s_diag_len;
+
+static void __attribute__((unused)) diag_log(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    if (s_diag_len < sizeof(s_diag_buf) - 1) {
+        int n = vsnprintf(s_diag_buf + s_diag_len,
+                          sizeof(s_diag_buf) - s_diag_len, fmt, ap);
+        if (n > 0) s_diag_len += (size_t)n;
+    }
+    va_end(ap);
+}
+
+const char *mmwave_get_diag(void)
+{
+    return s_diag_buf;
+}
+
 /* ======================================================================
  * MR60BHA2 Parser (corrected protocol from Seeed Arduino library)
  * ====================================================================== */
@@ -676,28 +698,6 @@ static int s_n_pin_sets;
 /* C1001 hardware presence/event outputs wired to the StickS3 HAT header. */
 #define C1001_IO_PIN_A  5
 #define C1001_IO_PIN_B  7
-
-/* Diagnostic transcript kept in RAM so headless nodes can serve it
- * remotely (GET /ota/diag). */
-static char s_diag_buf[512];
-static size_t s_diag_len;
-
-static void diag_log(const char *fmt, ...)
-{
-    va_list ap;
-    va_start(ap, fmt);
-    if (s_diag_len < sizeof(s_diag_buf) - 1) {
-        int n = vsnprintf(s_diag_buf + s_diag_len,
-                          sizeof(s_diag_buf) - s_diag_len, fmt, ap);
-        if (n > 0) s_diag_len += (size_t)n;
-    }
-    va_end(ap);
-}
-
-const char *mmwave_get_diag(void)
-{
-    return s_diag_buf;
-}
 
 /* Electrical diagnosis: a pin actively driven by the radar holds its level
  * regardless of our pull; a floating (unconnected) pin follows the pull. */

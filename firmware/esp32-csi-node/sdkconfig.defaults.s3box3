@@ -1,0 +1,43 @@
+# ESP32-S3-BOX-3 CSI Node — SDK Configuration (CSI-first, display TBD)
+# ESP32-S3 (QFN56) + 16MB flash + 16MB octal PSRAM.
+# Display (ILI9342C 320x240 + GT911 touch) not yet supported — the BOX-3
+# runs as a headless CSI peer / future ADR-065 coordinator for now.
+#
+# Usage: cp sdkconfig.defaults.s3box3 sdkconfig.defaults && idf.py set-target esp32s3 build
+
+# Target: ESP32-S3
+CONFIG_IDF_TARGET="esp32s3"
+
+# Partition table: dual-OTA (same layout as StickS3 nodes for uniform OTA)
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_4mb.csv"
+
+# Flash: 16MB
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+
+# PSRAM: 16MB octal @ 80MHz
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y
+
+# Display: off until the ILI9342C variant lands
+# CONFIG_DISPLAY_ENABLE is not set
+
+# OTA rollback: new images boot PENDING_VERIFY; main.c marks valid only
+# after the health gate (WiFi + CSI + OTA server up)
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# Compiler optimization: size
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+
+# WiFi CSI capture
+CONFIG_ESP_WIFI_CSI_ENABLED=y
+
+# Logging
+CONFIG_BOOTLOADER_LOG_LEVEL_WARN=y
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# LWIP: extended socket options
+CONFIG_LWIP_SO_RCVBUF=y
