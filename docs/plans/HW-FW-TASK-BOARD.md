@@ -10,6 +10,15 @@
 
 ## 1. Done this session (2026-08-05)
 
+- **OTA reachable over the tailnet** — persistent forwarder on pop-os
+  (`systemd-run --user` unit `ruview-ota-proxy-n1`, script
+  `~/.local/bin/ruview-ota-proxy.py`): `pop-os.tail8a7378.ts.net:18032` /
+  `100.72.92.31:18032` -> node 1 `192.168.178.41:8032`. Full subnet-router
+  option (needs sudo + admin-console route approval):
+  `sudo tailscale set --advertise-routes=192.168.178.0/24` + IP forwarding.
+- **OTA auth enabled end-to-end** — see 2.4 below (includes an init_ex PSK-load bugfix).
+- **AP BSSID CSI filter provisioned** — see 2.6 below.
+
 - **Node 1 StickS3 deployed and verified on real hardware** — ST7789 status UI running at 192.168.178.41, OTA :8032, CSI streaming to 192.168.178.35:5005 at edge_tier 2 (commits e8758176, d5a82c27; `firmware/esp32-csi-node/main/display_hal.c`, `display_ui.c`).
 - **Board identity review blocker CLOSED** — confirmed M5Stack StickS3 K150 (ST7789 135x240 + M5PM1 power gate) on physical hardware.
 - **OTA max-size cap fix landed** — `OTA_MAX_SIZE` = 0x1D0000 (1.875 MB) made node-1 OTA work (`firmware/esp32-csi-node/main/ota_update.c:26-27`; comment still stale, see Later).
@@ -38,17 +47,21 @@ The scheduling change (2.2) alters display/DSP behavior on the deployed node; CL
 - **Method:** build from `firmware/esp32-csi-node/sdkconfig.defaults.sticks3` (cp to `sdkconfig.defaults`, `idf.py set-target esp32s3 build`; keeps `partitions_4mb.csv` dual 1.875 MB OTA slots), OTA to 192.168.178.41:8032.
 - **Accept:** ST7789 display updates normally, CSI streams to 192.168.178.35:5005 at edge_tier 2, no watchdog/starvation symptoms.
 
-### 2.4 Add `--ota-psk` to provision.py and enable OTA auth on node 1 — owner: pop-os (VPS may draft code)
-OTA PSK read from NVS namespace `security` key `ota_psk` (`main/ota_update.c:30-31,250-256`; empty PSK = auth disabled, `ota_check_auth` :46-48). `provision.py` only writes the `csi_cfg` namespace (`build_nvs_csv` :33-38; argparse :173-197 has no flag). **Node 1 currently runs OTA with auth disabled.**
-- **Accept:** `--ota-psk` emits a `security` namespace + `ota_psk` string row in the NVS CSV; node 1 re-provisioned; OTA request without PSK rejected, with PSK accepted.
+### ~~2.4 Add `--ota-psk` to provision.py and enable OTA auth on node 1~~ — DONE 2026-08-05
+`provision.py --ota-psk` writes the `security`/`ota_psk` NVS row. Also fixed a latent
+firmware bug: `ota_update_init_ex()` (the variant main.c calls) never loaded the PSK, so
+auth could not activate on any prior build. Node 1 re-provisioned; verified through the
+tailnet proxy: no/wrong PSK -> 403, correct PSK -> accepted. PSK stored on pop-os at
+`~/.config/ruview/ota-psk-n1` (never commit it).
 
 ### 2.5 Resolve wasm_verify boot warning: `--wasm-pubkey` / `--wasm-verify` flags — owner: pop-os (VPS may draft code)
 Boot warns "wasm_verify=1 but no wasm_pubkey in NVS — uploads will be rejected" (`main/nvs_config.c:282`; default-on at :89; 32-byte blob key `wasm_pubkey` in `csi_cfg`, :271-280; `wasm_upload.c:116-129` rejects all uploads without it). `provision.py` cannot write either value.
 - **Accept:** `--wasm-pubkey <hex32>` (hex2bin blob row) and optional `--wasm-verify 0|1` in provision.py; node 1 provisioned with its Ed25519 pubkey; boot warning gone; signed upload accepted.
 
-### 2.6 Provision BSSID/MAC source filter on node 1 — owner: pop-os
-Firmware support exists (ADR-060): NVS MAC filter drops non-matching CSI frames (`main/csi_collector.c:159-163`), provisioned via `provision.py --filter-mac` (:196). Operational only — fold into the 2.4/2.5 re-provisioning pass.
-- **Accept:** node 1 provisioned with the AP BSSID; frames from neighboring transmitters no longer ingested; `--filter-mac` documented as standard procedure for nodes 2/3.
+### ~~2.6 Provision BSSID/MAC source filter on node 1~~ — DONE 2026-08-05
+Node 1 provisioned with `--filter-mac 80:23:95:08:25:29` (FRITZ!Box BSSID); boot log
+confirms `filter_mac` override loaded. Standard procedure for nodes 2/3: always pass
+`--filter-mac <AP BSSID>` at provisioning.
 
 ### 2.7 Implement OTA rollback + capture on-hardware rollback evidence — owner: pop-os
 No call to `esp_ota_mark_app_valid_cancel_rollback` anywhere in `main/` (`ota_update.c` only calls `esp_ota_set_boot_partition` at :180); `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` in zero `sdkconfig.defaults*` files. Independent-review blocker (rollback evidence) still open.

@@ -71,6 +71,10 @@ def build_nvs_csv(args):
         mac_bytes = bytes(int(b, 16) for b in args.filter_mac.split(":"))
         # NVS blob: write as hex-encoded string for CSV compatibility
         writer.writerow(["filter_mac", "data", "hex2bin", mac_bytes.hex()])
+    # ADR-050: OTA authentication PSK (separate "security" namespace)
+    if args.ota_psk is not None:
+        writer.writerow(["security", "namespace", "", ""])
+        writer.writerow(["ota_psk", "data", "string", args.ota_psk])
     return buf.getvalue()
 
 
@@ -119,16 +123,40 @@ def generate_nvs_binary(csv_content, size):
                 os.unlink(p)
 
 
+def detect_chip(port):
+    """Auto-detect ESP chip type via esptool."""
+    try:
+        result = subprocess.check_output(
+            [sys.executable, "-m", "esptool", "--port", port, "chip_id"],
+            stderr=subprocess.STDOUT, timeout=10,
+        )
+        text = result.decode("utf-8", errors="replace")
+        for chip in ["esp32c6", "esp32c3", "esp32s3", "esp32s2", "esp32h2", "esp32"]:
+            if chip.upper().replace("ESP32", "ESP32-").replace("ESP32-C", "ESP32-C") in text or chip in text.lower():
+                return chip
+        # Fallback: look for "Chip is ESP32-XX" pattern
+        import re
+        m = re.search(r"Chip is (ESP32[\-\w]*)", text)
+        if m:
+            return m.group(1).lower().replace("-", "")
+    except Exception:
+        pass
+    return "auto"
+
+
 def flash_nvs(port, baud, nvs_bin):
     """Flash the NVS partition binary to the ESP32."""
     with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as f:
         f.write(nvs_bin)
         bin_path = f.name
 
+    chip = detect_chip(port)
+    print(f"Detected chip: {chip}")
+
     try:
         cmd = [
             sys.executable, "-m", "esptool",
-            "--chip", "esp32s3",
+            "--chip", chip,
             "--port", port,
             "--baud", str(baud),
             "write_flash",
@@ -170,6 +198,10 @@ def main():
     parser.add_argument("--channel", type=int, help="CSI channel (1-14 for 2.4GHz, 36-177 for 5GHz). "
                         "Overrides auto-detection from connected AP.")
     parser.add_argument("--filter-mac", type=str, help="MAC address to filter CSI frames (AA:BB:CC:DD:EE:FF)")
+    parser.add_argument("--ota-psk", type=str,
+                        help="OTA authentication PSK (ADR-050). Written to NVS namespace "
+                             "'security' key 'ota_psk'; OTA uploads then require "
+                             "'Authorization: Bearer <psk>'. Omit = OTA auth disabled.")
     parser.add_argument("--dry-run", action="store_true", help="Generate NVS binary but don't flash")
 
     args = parser.parse_args()
@@ -182,6 +214,7 @@ def main():
         args.fall_thresh is not None, args.vital_win is not None,
         args.vital_int is not None, args.subk_count is not None,
         args.channel is not None, args.filter_mac is not None,
+        args.ota_psk is not None,
     ])
     if not has_value:
         parser.error("At least one config value must be specified")
@@ -224,6 +257,8 @@ def main():
     if args.edge_tier is not None:
         tier_desc = {0: "off (raw CSI)", 1: "stats", 2: "vitals"}
         print(f"  Edge Tier:     {args.edge_tier} ({tier_desc.get(args.edge_tier, '?')})")
+    if args.ota_psk is not None:
+        print(f"  OTA PSK:       {'*' * len(args.ota_psk)} (auth enabled)")
     if args.pres_thresh is not None:
         print(f"  Pres Thresh:   {args.pres_thresh}")
     if args.fall_thresh is not None:

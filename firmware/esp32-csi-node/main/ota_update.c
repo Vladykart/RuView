@@ -245,26 +245,31 @@ static esp_err_t ota_start_server(httpd_handle_t *out_handle)
     return ESP_OK;
 }
 
-esp_err_t ota_update_init(void)
+/** ADR-050: Load the OTA PSK from NVS if provisioned. */
+static void ota_load_psk(void)
 {
-    /* ADR-050: Load OTA PSK from NVS if provisioned. */
     nvs_handle_t nvs;
     if (nvs_open(OTA_NVS_NAMESPACE, NVS_READONLY, &nvs) == ESP_OK) {
         size_t len = sizeof(s_ota_psk);
         if (nvs_get_str(nvs, OTA_NVS_KEY, s_ota_psk, &len) == ESP_OK) {
             ESP_LOGI(TAG, "OTA PSK loaded from NVS (%d chars) — authentication enabled", (int)len - 1);
         } else {
-            ESP_LOGW(TAG, "No OTA PSK in NVS — OTA authentication DISABLED (provision with nvs_set)");
+            ESP_LOGW(TAG, "No OTA PSK in NVS — OTA authentication DISABLED (provision with --ota-psk)");
         }
         nvs_close(nvs);
     } else {
         ESP_LOGW(TAG, "NVS namespace '%s' not found — OTA authentication DISABLED", OTA_NVS_NAMESPACE);
     }
+}
 
+esp_err_t ota_update_init(void)
+{
+    ota_load_psk();
     return ota_start_server(NULL);
 }
 
 esp_err_t ota_update_init_ex(void **out_server)
 {
+    ota_load_psk();
     return ota_start_server((httpd_handle_t *)out_server);
 }
