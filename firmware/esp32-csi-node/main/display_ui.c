@@ -119,13 +119,11 @@ void display_ui_create(lv_obj_t *parent)
     lv_obj_clear_flag(parent, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scrollbar_mode(parent, LV_SCROLLBAR_MODE_OFF);
 
-    /* ---- Header: brand + node id, hairline below ---- */
-    mk_text(parent, PAD + 2, 7, 80, &lv_font_montserrat_14, COLOR_CYAN,
-            LV_TEXT_ALIGN_LEFT, "RuView");
-    char node[8];
-    snprintf(node, sizeof(node), "N%d", g_nvs_config.node_id);
-    mk_text(parent, SCR_W - PAD - 34, 9, 32, &lv_font_montserrat_12,
-            COLOR_TEXT_DIM, LV_TEXT_ALIGN_RIGHT, node);
+    /* ---- Header: node identity, hairline below ---- */
+    char node[12];
+    snprintf(node, sizeof(node), "NODE %d", g_nvs_config.node_id);
+    mk_text(parent, PAD + 2, 7, SCR_W - 2 * PAD - 4, &lv_font_montserrat_14,
+            COLOR_CYAN, LV_TEXT_ALIGN_LEFT, node);
     lv_obj_t *rule = lv_obj_create(parent);
     lv_obj_set_pos(rule, PAD + 2, 26);
     lv_obj_set_size(rule, CARD_W - 4, 1);
