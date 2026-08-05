@@ -31,6 +31,10 @@ CONFIG_DISPLAY_BRIGHTNESS=80
 # RGB565 byte swap — required for SPI panels (ST7789 reads bytes big-endian)
 CONFIG_LV_COLOR_16_SWAP=y
 
+# OTA rollback: new images boot PENDING_VERIFY; main.c marks valid only
+# after the health gate (WiFi + CSI + OTA server up)
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
 # LVGL fonts used by the StickS3 card UI
 CONFIG_LV_FONT_MONTSERRAT_12=y
 CONFIG_LV_FONT_MONTSERRAT_14=y
