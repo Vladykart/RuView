@@ -93,6 +93,11 @@ static void wifi_init_sta(void)
     wifi_config_t wifi_config = {
         .sta = {
             .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+            /* Robust join for WPA2/WPA3-transition APs (e.g. FRITZ!Box):
+             * advertise PMF-capable and scan all channels. */
+            .pmf_cfg = { .capable = true, .required = false },
+            .sae_pwe_h2e = WPA3_SAE_PWE_BOTH,
+            .scan_method = WIFI_ALL_CHANNEL_SCAN,
         },
     };
 

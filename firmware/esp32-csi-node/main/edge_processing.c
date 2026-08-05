@@ -846,8 +846,11 @@ static void edge_task(void *arg)
             vTaskDelay(1);
 #endif
         } else {
-            /* No frames available — yield briefly. */
-            vTaskDelay(pdMS_TO_TICKS(1));
+            /* No frames available — yield for at least 1 tick.
+             * pdMS_TO_TICKS(1) == 0 on 100 Hz tick rate, which makes
+             * vTaskDelay(0) a no-op and starves lower-priority tasks
+             * (display at priority 1). Force minimum 1 tick (10 ms). */
+            vTaskDelay(1);
         }
     }
 }
@@ -971,7 +974,7 @@ esp_err_t edge_processing_init(const edge_config_t *cfg)
     const UBaseType_t dsp_priority = 5;
 #else
     const BaseType_t dsp_core = tskNO_AFFINITY;
-    const UBaseType_t dsp_priority = 1;  /* Below WiFi (23) and display (1) — share time. */
+    const UBaseType_t dsp_priority = 2;  /* Above display (1), below WiFi (23). */
 #endif
     BaseType_t ret = xTaskCreatePinnedToCore(
         edge_task,
