@@ -694,11 +694,7 @@ static void mmwave_uart_task(void *arg)
 static int s_pin_sets[5][2];
 static int s_n_pin_sets;
 
-#if CONFIG_DISPLAY_STICKS3
-/* C1001 hardware presence/event outputs wired to the StickS3 HAT header. */
-#define C1001_IO_PIN_A  5
-#define C1001_IO_PIN_B  7
-
+#if CONFIG_DISPLAY_STICKS3 || CONFIG_DISPLAY_S3BOX3
 /* Electrical diagnosis: a pin actively driven by the radar holds its level
  * regardless of our pull; a floating (unconnected) pin follows the pull. */
 static void c1001_io_pin_diagnose(int pin)
@@ -717,6 +713,12 @@ static void c1001_io_pin_diagnose(int pin)
              pin, with_down, with_up, verdict);
     diag_log("G%d=%s; ", pin, verdict);
 }
+#endif /* CONFIG_DISPLAY_STICKS3 || CONFIG_DISPLAY_S3BOX3 */
+
+#if CONFIG_DISPLAY_STICKS3
+/* C1001 hardware presence/event outputs wired to the StickS3 HAT header. */
+#define C1001_IO_PIN_A  5
+#define C1001_IO_PIN_B  7
 
 static void c1001_io_pins_init(void)
 {
@@ -909,6 +911,16 @@ esp_err_t mmwave_sensor_init(int uart_tx_pin, int uart_rx_pin)
         pin_sets[3][0] = 10; pin_sets[3][1] = 9;
         pin_sets[4][0] = 17; pin_sets[4][1] = 18;
         n_pin_sets = 5;
+#elif CONFIG_DISPLAY_S3BOX3
+        /* BOX-3 dock: PMOD2 exposes GPIO43/44 (default UART), PMOD1 has
+         * GPIO42/21 as the fallback pair; console is USB-Serial-JTAG so
+         * 43/44 are free. Legacy 17/18 last. */
+        pin_sets[0][0] = 43; pin_sets[0][1] = 44;
+        pin_sets[1][0] = 44; pin_sets[1][1] = 43;
+        pin_sets[2][0] = 42; pin_sets[2][1] = 21;
+        pin_sets[3][0] = 21; pin_sets[3][1] = 42;
+        pin_sets[4][0] = 17; pin_sets[4][1] = 18;
+        n_pin_sets = 5;
 #else
         pin_sets[0][0] = 17; pin_sets[0][1] = 18;
         n_pin_sets = 1;
@@ -921,6 +933,12 @@ esp_err_t mmwave_sensor_init(int uart_tx_pin, int uart_rx_pin)
      * UART TX from the sensor holds the line HIGH; floating = no wire. */
     c1001_io_pin_diagnose(43);
     c1001_io_pin_diagnose(44);
+#elif CONFIG_DISPLAY_S3BOX3
+    /* BOX-3 dock wire check: PMOD2 UART pair + PMOD1 fallback pair. */
+    c1001_io_pin_diagnose(43);
+    c1001_io_pin_diagnose(44);
+    c1001_io_pin_diagnose(42);
+    c1001_io_pin_diagnose(21);
 #endif
 
     /* Install UART driver at MR60 baud (will be changed during probe). */
