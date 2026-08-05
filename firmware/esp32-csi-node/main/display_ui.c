@@ -41,14 +41,17 @@ static const char *TAG = "disp_ui";
 #elif CONFIG_DISPLAY_STICKS3
 #define SCR_W  135
 #define SCR_H  240
+#elif CONFIG_DISPLAY_S3BOX3
+#define SCR_W  320
+#define SCR_H  240
 #else
 #define SCR_W  368
 #define SCR_H  448
 #endif
 
-#if CONFIG_DISPLAY_STICKS3
+#if CONFIG_DISPLAY_STICKS3 || CONFIG_DISPLAY_S3BOX3
 /* ===========================================================================
- * StickS3 simple status UI — one screen, essentials only, no charts.
+ * StickS3 / S3-BOX-3 simple status UI — one screen, essentials, no charts.
  *
  * The full 4-view dashboard starves CPU0 on this board (task_wdt) and is
  * unreadable at 135x240 anyway. Show the most important information plus

@@ -28,6 +28,9 @@
 #elif CONFIG_DISPLAY_STICKS3
 #define DISP_H_RES  135
 #define DISP_V_RES  240
+#elif CONFIG_DISPLAY_S3BOX3
+#define DISP_H_RES  320
+#define DISP_V_RES  240
 #else
 #define DISP_H_RES  368
 #define DISP_V_RES  448

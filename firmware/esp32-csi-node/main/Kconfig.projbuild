@@ -109,6 +109,17 @@ menu "AMOLED Display (ADR-045)"
             CS=41, RST=21, backlight GPIO38 active-high, gap (52,40),
             color inversion on.
 
+    config DISPLAY_S3BOX3
+        bool "ESP32-S3-BOX-3 ST7789/ILI9342C 320x240 panel"
+        default n
+        depends on DISPLAY_ENABLE && IDF_TARGET_ESP32S3 && !DISPLAY_STICKS3
+        help
+            Drive the ESP32-S3-BOX-3 integrated 2.4" 320x240 panel.
+            Pin profile per esp-bsp esp-box-3: SPI3 @ 40 MHz, MOSI=6,
+            SCLK=7, CS=5, DC=4, RST=48, backlight=47 (PWM active-high),
+            mirror both axes. Uses the ST7789 esp_lcd driver (newer
+            BOX-3 units; ILI9342C units may need color tweaks).
+
     config DISPLAY_FPS_LIMIT
         int "Display refresh rate limit (FPS)"
         default 30
