@@ -220,6 +220,11 @@ struct NodeInfo {
     rssi_dbm: f64,
     position: [f64; 3],
     amplitude: Vec<f64>,
+    /// Per-subcarrier CSI phase (radians, atan2(q,i)). Complex-CSI upgrade
+    /// (HERDR Stage-0 signal integrity): amplitude alone can't separate
+    /// activities or confirm vitals; phase enables conjugate-ratio denoising.
+    #[serde(default)]
+    phase: Vec<f64>,
     subcarrier_count: usize,
 }
 
@@ -1268,6 +1273,7 @@ async fn windows_wifi_task(state: SharedState, tick_ms: u64) {
                 rssi_dbm: first_rssi,
                 position: [0.0, 0.0, 0.0],
                 amplitude: multi_ap_frame.amplitudes,
+                phase: vec![],
                 subcarrier_count: obs_count,
             }],
             features,
@@ -1398,6 +1404,7 @@ async fn windows_wifi_fallback_tick(state: &SharedState, seq: u32) {
             rssi_dbm,
             position: [0.0, 0.0, 0.0],
             amplitude: vec![signal_pct],
+            phase: vec![],
             subcarrier_count: 1,
         }],
         features,
@@ -1646,6 +1653,7 @@ async fn linux_wifi_task(state: SharedState, tick_ms: u64) {
                 rssi_dbm,
                 position: [0.0, 0.0, 0.0],
                 amplitude: frame.amplitudes.clone(),
+                phase: vec![],
                 subcarrier_count: n_sub,
             }],
             features,
@@ -3106,6 +3114,7 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                             rssi_dbm: features.mean_rssi,
                             position: node_position(frame.node_id),
                             amplitude: frame.amplitudes.iter().take(56).cloned().collect(),
+                            phase: frame.phases.iter().take(56).cloned().collect(),
                             subcarrier_count: frame.n_subcarriers as usize,
                         }],
                         features: features.clone(),
@@ -3211,6 +3220,7 @@ async fn simulated_data_task(state: SharedState, tick_ms: u64) {
                 rssi_dbm: features.mean_rssi,
                 position: [2.0, 0.0, 1.5],
                 amplitude: frame_amplitudes,
+                phase: vec![],
                 subcarrier_count: frame_n_sub as usize,
             }],
             features: features.clone(),
