@@ -5,7 +5,12 @@ set(SRCS
     "mmwave_sensor.c"
 )
 
-set(REQUIRES "")
+# Explicit component dependencies for the main component. (json = cJSON for the
+# OTA /config endpoint; the rest are what main's sources #include.)
+set(REQUIRES
+    nvs_flash esp_wifi esp_http_server app_update esp_netif
+    mbedtls driver esp_timer esp_adc esp_hw_support json
+)
 
 # ADR-061: Mock CSI generator for QEMU testing
 if(CONFIG_CSI_MOCK_ENABLED)
@@ -18,9 +23,9 @@ endif()
 if(CONFIG_DISPLAY_ENABLE)
     list(APPEND SRCS "display_hal.c" "display_ui.c" "display_task.c")
     if(CONFIG_IDF_TARGET_ESP32C6)
-        set(REQUIRES esp_lcd lvgl driver)
+        list(APPEND REQUIRES esp_lcd lvgl)
     else()
-        set(REQUIRES esp_lcd esp_lcd_touch lvgl)
+        list(APPEND REQUIRES esp_lcd esp_lcd_touch lvgl)
     endif()
 endif()
 

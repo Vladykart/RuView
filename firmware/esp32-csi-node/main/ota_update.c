@@ -18,6 +18,12 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "mmwave_sensor.h"
+#include "display_hal.h"
+#include "esp_system.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "sdkconfig.h"
+#include "cJSON.h"
 
 static const char *TAG = "ota_update";
 
@@ -74,6 +80,101 @@ static bool ota_check_auth(httpd_req_t *req)
 }
 
 /**
+ * POST /reboot — authenticated clean restart (esp_restart). Used by the web
+ * dashboard's reboot button; also the clean way to bring the LCD up.
+ */
+static esp_err_t ota_reboot_handler(httpd_req_t *req)
+{
+    if (!ota_check_auth(req)) {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"unauthorized\"}");
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"ok\",\"message\":\"rebooting\"}");
+    vTaskDelay(pdMS_TO_TICKS(300));
+    esp_restart();
+    return ESP_OK;  /* not reached */
+}
+
+/**
+ * POST /config — write runtime config to NVS (csi_cfg) over the air, then
+ * reboot. JSON body: {ssid,password,channel,node_id,target_ip} (all optional).
+ * Used by the web dashboard's per-node Config form.
+ */
+static esp_err_t ota_config_handler(httpd_req_t *req)
+{
+    if (!ota_check_auth(req)) {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"unauthorized\"}");
+        return ESP_OK;
+    }
+    int total = req->content_len;
+    if (total <= 0 || total > 1024) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_sendstr(req, "{\"error\":\"bad body\"}");
+        return ESP_OK;
+    }
+    char body[1025];
+    int rcv = 0;
+    while (rcv < total) {
+        int r = httpd_req_recv(req, body + rcv, total - rcv);
+        if (r <= 0) { httpd_resp_set_status(req, "400 Bad Request");
+                      httpd_resp_sendstr(req, "{\"error\":\"recv\"}"); return ESP_OK; }
+        rcv += r;
+    }
+    body[rcv] = '\0';
+
+    cJSON *j = cJSON_Parse(body);
+    if (!j) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_sendstr(req, "{\"error\":\"invalid json\"}");
+        return ESP_OK;
+    }
+    nvs_handle_t h;
+    if (nvs_open("csi_cfg", NVS_READWRITE, &h) != ESP_OK) {
+        cJSON_Delete(j);
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_sendstr(req, "{\"error\":\"nvs\"}");
+        return ESP_OK;
+    }
+    int changed = 0;
+    cJSON *it;
+    if ((it = cJSON_GetObjectItem(j, "ssid")) && cJSON_IsString(it) && strlen(it->valuestring)) {
+        nvs_set_str(h, "ssid", it->valuestring); changed++;
+    }
+    if ((it = cJSON_GetObjectItem(j, "password")) && cJSON_IsString(it)) {
+        nvs_set_str(h, "password", it->valuestring); changed++;
+    }
+    if ((it = cJSON_GetObjectItem(j, "target_ip")) && cJSON_IsString(it) && strlen(it->valuestring)) {
+        nvs_set_str(h, "target_ip", it->valuestring); changed++;
+    }
+    if ((it = cJSON_GetObjectItem(j, "channel")) && cJSON_IsNumber(it) && it->valueint > 0) {
+        nvs_set_u8(h, "csi_channel", (uint8_t)it->valueint); changed++;
+    }
+    if ((it = cJSON_GetObjectItem(j, "node_id")) && cJSON_IsNumber(it) && it->valueint >= 0) {
+        uint8_t nid = (uint8_t)it->valueint;
+        nvs_set_u8(h, "node_id", nid);
+        if (nid >= 1) nvs_set_u8(h, "tdm_slot", (uint8_t)(nid - 1));  /* keep slot aligned */
+        changed++;
+    }
+    nvs_commit(h);
+    nvs_close(h);
+    cJSON_Delete(j);
+
+    char resp[96];
+    snprintf(resp, sizeof(resp),
+             "{\"status\":\"ok\",\"changed\":%d,\"message\":\"saved, rebooting\"}", changed);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, resp);
+    vTaskDelay(pdMS_TO_TICKS(400));
+    esp_restart();
+    return ESP_OK;  /* not reached */
+}
+
+/**
  * GET /ota/status — return firmware version and partition info.
  */
 static esp_err_t ota_status_handler(httpd_req_t *req)
@@ -86,16 +187,27 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
     mmwave_state_t mw;
     bool has_mw = mmwave_sensor_get_state(&mw);
 
-    char response[512];
+    /* Battery (StickS3 M5PM1 PMU). -1 when the board has no battery monitor. */
+    int batt_mv = -1, batt_pct = -1;
+#if CONFIG_DISPLAY_STICKS3
+    {
+        uint16_t mv = 0; uint8_t pct = 0;
+        if (display_hal_battery(&mv, &pct) == ESP_OK) { batt_mv = mv; batt_pct = pct; }
+    }
+#endif
+
+    char response[640];
     int len = snprintf(response, sizeof(response),
         "{\"version\":\"%s\",\"date\":\"%s\",\"time\":\"%s\","
         "\"running_partition\":\"%s\",\"next_partition\":\"%s\","
         "\"max_size\":%d,"
+        "\"battery_mv\":%d,\"battery_pct\":%d,"
         "\"mmwave\":\"%s\",\"mmwave_present\":%s,\"mmwave_frames\":%lu}",
         app->version, app->date, app->time,
         running ? running->label : "unknown",
         update ? update->label : "none",
         OTA_MAX_SIZE,
+        batt_mv, batt_pct,
         has_mw ? mmwave_type_name(mw.type) : "none",
         (has_mw && mw.person_present) ? "true" : "false",
         (unsigned long)(has_mw ? mw.frame_count : 0));
@@ -248,6 +360,20 @@ static esp_err_t ota_start_server(httpd_handle_t *out_handle)
         if (out_handle) *out_handle = NULL;
         return err;
     }
+
+    httpd_uri_t reboot_uri = {
+        .uri      = "/reboot",
+        .method   = HTTP_POST,
+        .handler  = ota_reboot_handler,
+    };
+    httpd_register_uri_handler(server, &reboot_uri);
+
+    httpd_uri_t config_uri = {
+        .uri      = "/config",
+        .method   = HTTP_POST,
+        .handler  = ota_config_handler,
+    };
+    httpd_register_uri_handler(server, &config_uri);
 
     httpd_uri_t status_uri = {
         .uri      = "/ota/status",

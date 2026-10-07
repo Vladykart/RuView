@@ -21,6 +21,8 @@ extern nvs_config_t g_nvs_config;
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "edge_processing.h"
+#include "mmwave_sensor.h"
+#include "display_hal.h"
 
 static const char *TAG = "disp_ui";
 
@@ -79,6 +81,7 @@ static lv_obj_t *s_lbl_rssi     = NULL;
 static lv_obj_t *s_lbl_ip       = NULL;
 static lv_obj_t *s_lbl_target   = NULL;
 static lv_obj_t *s_lbl_uptime   = NULL;
+static lv_obj_t *s_lbl_batt     = NULL;   /* battery % (top-right) */
 static lv_obj_t *s_wifi_bars[4] = {NULL};
 
 static lv_obj_t *mk_card(lv_obj_t *parent, int x, int y, int w, int h)
@@ -124,6 +127,10 @@ void display_ui_create(lv_obj_t *parent)
     snprintf(node, sizeof(node), "NODE %d", g_nvs_config.node_id);
     mk_text(parent, PAD + 2, 7, SCR_W - 2 * PAD - 4, &lv_font_montserrat_14,
             COLOR_CYAN, LV_TEXT_ALIGN_LEFT, node);
+    /* Battery % — right-aligned on the header row (populated in update). */
+    s_lbl_batt = mk_text(parent, PAD + 2, 7, SCR_W - 2 * PAD - 4,
+                         &lv_font_montserrat_14, COLOR_TEXT_DIM,
+                         LV_TEXT_ALIGN_RIGHT, "");
     lv_obj_t *rule = lv_obj_create(parent);
     lv_obj_set_pos(rule, PAD + 2, 26);
     lv_obj_set_size(rule, CARD_W - 4, 1);
@@ -221,31 +228,33 @@ void display_ui_update(void)
     edge_vitals_pkt_t vitals;
     bool has_vitals = edge_get_vitals(&vitals);
 
-    /* ---- Hero presence state ---- */
-    if (!has_ip && g_nvs_config.wifi_ssid[0] != '\0') {
+    /* ---- Hero presence state (AT581x radar + CSI edge, works offline) ---- */
+    mmwave_state_t mw;
+    bool has_mw = mmwave_sensor_get_state(&mw);
+    bool present = (has_vitals && ((vitals.flags & 0x01) || vitals.n_persons > 0))
+                   || (has_mw && mw.person_present);
+    if (present) {
+        lv_label_set_text(s_lbl_state, "OCCUPIED");
+        lv_obj_set_style_text_color(s_lbl_state, COLOR_GREEN, 0);
+        lv_obj_set_style_border_color(s_hero_card, COLOR_GREEN, 0);
+        if (has_vitals && vitals.n_persons > 1)
+            snprintf(buf, sizeof(buf), "%u persons", vitals.n_persons);
+        else
+            snprintf(buf, sizeof(buf), "1 person");
+        lv_label_set_text(s_lbl_substate, buf);
+        lv_obj_set_style_text_color(s_lbl_substate, COLOR_GREEN, 0);
+    } else if (!has_ip && g_nvs_config.wifi_ssid[0] != '\0' && !has_mw) {
+        /* Only show JOINING when there's no local sensor to report presence. */
         lv_label_set_text(s_lbl_state, "JOINING");
         lv_obj_set_style_text_color(s_lbl_state, COLOR_AMBER, 0);
         lv_label_set_text(s_lbl_substate, g_nvs_config.wifi_ssid);
         lv_obj_set_style_border_color(s_hero_card, CARD_BORDER, 0);
-    } else if (has_vitals) {
-        bool present = (vitals.flags & 0x01) || vitals.n_persons > 0;
-        if (present) {
-            lv_label_set_text(s_lbl_state, "OCCUPIED");
-            lv_obj_set_style_text_color(s_lbl_state, COLOR_GREEN, 0);
-            lv_obj_set_style_border_color(s_hero_card, COLOR_GREEN, 0);
-            if (vitals.n_persons > 1)
-                snprintf(buf, sizeof(buf), "%u persons", vitals.n_persons);
-            else
-                snprintf(buf, sizeof(buf), "1 person");
-            lv_label_set_text(s_lbl_substate, buf);
-            lv_obj_set_style_text_color(s_lbl_substate, COLOR_GREEN, 0);
-        } else {
-            lv_label_set_text(s_lbl_state, "EMPTY");
-            lv_obj_set_style_text_color(s_lbl_state, COLOR_TEXT_DIM, 0);
-            lv_obj_set_style_border_color(s_hero_card, CARD_BORDER, 0);
-            lv_label_set_text(s_lbl_substate, "watching");
-            lv_obj_set_style_text_color(s_lbl_substate, COLOR_TEXT_DIM, 0);
-        }
+    } else {
+        lv_label_set_text(s_lbl_state, "EMPTY");
+        lv_obj_set_style_text_color(s_lbl_state, COLOR_TEXT_DIM, 0);
+        lv_obj_set_style_border_color(s_hero_card, CARD_BORDER, 0);
+        lv_label_set_text(s_lbl_substate, has_mw ? mmwave_type_name(mw.type) : "watching");
+        lv_obj_set_style_text_color(s_lbl_substate, COLOR_TEXT_DIM, 0);
     }
 
     /* ---- Vitals ---- */
@@ -279,6 +288,20 @@ void display_ui_update(void)
                 vitals.rssi >= thresh[i] ? COLOR_CYAN : BAR_OFF, 0);
         }
     }
+
+#if CONFIG_DISPLAY_STICKS3
+    /* ---- Battery (M5PM1 PMU), refreshed ~every 3 s ---- */
+    static int s_batt_div = 0;
+    if (s_lbl_batt && (s_batt_div++ % 30) == 0) {
+        uint8_t bpct = 0;
+        if (display_hal_battery(NULL, &bpct) == ESP_OK) {
+            snprintf(buf, sizeof(buf), "%u%%", (unsigned)bpct);
+            lv_label_set_text(s_lbl_batt, buf);
+            lv_color_t bc = bpct > 50 ? COLOR_GREEN : (bpct > 20 ? COLOR_AMBER : COLOR_RED);
+            lv_obj_set_style_text_color(s_lbl_batt, bc, 0);
+        }
+    }
+#endif
 
     /* ---- Uptime ---- */
     uint32_t up_min = now_ms / 60000;

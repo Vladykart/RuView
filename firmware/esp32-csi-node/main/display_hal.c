@@ -231,6 +231,7 @@ void display_hal_set_brightness(uint8_t percent)
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"
 #include "driver/i2c.h"
+#include "driver/ledc.h"
 
 #define S3S_SCLK       40
 #define S3S_MOSI       39
@@ -296,6 +297,28 @@ static esp_err_t sticks3_lcd_power_on(void)
     return err;
 }
 
+/* ---- M5PM1 battery monitor (250 mAh 1S LiPo). VBAT in millivolts: low
+ * byte at 0x22, high bits at 0x23. Percent is a simple 1S-LiPo linear map. */
+#define M5PM1_REG_VBAT_L 0x22
+#define M5PM1_REG_VBAT_H 0x23
+
+esp_err_t display_hal_battery(uint16_t *mv_out, uint8_t *pct_out)
+{
+    uint8_t lo = 0, hi = 0, rl = M5PM1_REG_VBAT_L, rh = M5PM1_REG_VBAT_H;
+    esp_err_t e = i2c_master_write_read_device(S3S_I2C_PORT, M5PM1_ADDR, &rl, 1, &lo, 1, pdMS_TO_TICKS(100));
+    if (e == ESP_OK) e = i2c_master_write_read_device(S3S_I2C_PORT, M5PM1_ADDR, &rh, 1, &hi, 1, pdMS_TO_TICKS(100));
+    if (e != ESP_OK) return e;
+    uint16_t mv = ((uint16_t)hi << 8) | lo;
+    if (mv_out) *mv_out = mv;
+    if (pct_out) {
+        int p = ((int)mv - 3300) * 100 / (4200 - 3300);
+        if (p < 0) p = 0;
+        if (p > 100) p = 100;
+        *pct_out = (uint8_t)p;
+    }
+    return ESP_OK;
+}
+
 esp_err_t display_hal_init_panel(void)
 {
     ESP_LOGI(TAG, "Initializing M5Stack StickS3 ST7789 (%dx%d)...", ST_H_RES, ST_V_RES);
@@ -304,13 +327,25 @@ esp_err_t display_hal_init_panel(void)
     sticks3_lcd_power_on();
     vTaskDelay(pdMS_TO_TICKS(20));
 
-    /* Backlight on — plain GPIO, active high */
-    gpio_config_t blk_cfg = {
-        .pin_bit_mask = (1ULL << S3S_BLK),
-        .mode = GPIO_MODE_OUTPUT,
+    /* Backlight via LEDC PWM — uniform, settable brightness across units
+     * (plain GPIO on/off gave inconsistent lighting). */
+    ledc_timer_config_t bl_timer = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = LEDC_TIMER_8_BIT,
+        .timer_num = LEDC_TIMER_0,
+        .freq_hz = 5000,
+        .clk_cfg = LEDC_AUTO_CLK,
     };
-    gpio_config(&blk_cfg);
-    gpio_set_level(S3S_BLK, 1);
+    ledc_timer_config(&bl_timer);
+    ledc_channel_config_t bl_ch = {
+        .gpio_num = S3S_BLK,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_0,
+        .timer_sel = LEDC_TIMER_0,
+        .duty = (uint32_t)CONFIG_DISPLAY_BRIGHTNESS * 255 / 100,
+        .hpoint = 0,
+    };
+    ledc_channel_config(&bl_ch);
 
     /* Hardware reset */
     gpio_config_t rst_cfg = {
@@ -337,7 +372,7 @@ esp_err_t display_hal_init_panel(void)
     esp_lcd_panel_io_spi_config_t io_config = {
         .dc_gpio_num = S3S_DC,
         .cs_gpio_num = S3S_CS,
-        .pclk_hz = 40 * 1000 * 1000,
+        .pclk_hz = 26 * 1000 * 1000,   /* 26 MHz: stable, no flicker/artifacts (40 was glitchy) */
         .lcd_cmd_bits = 8,
         .lcd_param_bits = 8,
         .spi_mode = 0,
@@ -386,8 +421,9 @@ bool display_hal_touch_read(uint16_t *x, uint16_t *y)
 
 void display_hal_set_brightness(uint8_t percent)
 {
-    /* Plain GPIO backlight: on/off only */
-    gpio_set_level(S3S_BLK, percent > 0 ? 1 : 0);
+    if (percent > 100) percent = 100;
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, (uint32_t)percent * 255 / 100);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
 }
 
 #elif CONFIG_DISPLAY_S3BOX3

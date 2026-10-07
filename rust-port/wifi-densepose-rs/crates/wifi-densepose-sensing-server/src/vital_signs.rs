@@ -46,6 +46,8 @@ pub struct VitalSigns {
     pub heartbeat_confidence: f64,
     /// Overall signal quality metric (0.0 - 1.0).
     pub signal_quality: f64,
+    /// Estimated displacement in millimeters (geometric sensing).
+    pub displacement_mm: f64,
 }
 
 impl Default for VitalSigns {
@@ -56,7 +58,61 @@ impl Default for VitalSigns {
             breathing_confidence: 0.0,
             heartbeat_confidence: 0.0,
             signal_quality: 0.0,
+            displacement_mm: 0.0,
         }
+    }
+}
+
+// ── Phase Unwrapper ────────────────────────────────────────────────────────
+
+/// Tracks absolute phase across time for each subcarrier by resolving
+/// 2π ambiguities (unwrapping). Enables geometric displacement sensing.
+pub struct PhaseUnwrapper {
+    last_phases: Vec<f64>,
+    absolute_phases: Vec<f64>,
+    initialized: bool,
+}
+
+impl PhaseUnwrapper {
+    pub fn new() -> Self {
+        Self {
+            last_phases: Vec::new(),
+            absolute_phases: Vec::new(),
+            initialized: false,
+        }
+    }
+
+    /// Unwrap current phases and return the absolute phase vector.
+    pub fn unwrap(&mut self, current_phases: &[f64]) -> &[f64] {
+        if !self.initialized || current_phases.len() != self.last_phases.len() {
+            self.last_phases = current_phases.to_vec();
+            self.absolute_phases = current_phases.to_vec();
+            self.initialized = true;
+            return &self.absolute_phases;
+        }
+
+        for i in 0..current_phases.len() {
+            let mut diff = current_phases[i] - self.last_phases[i];
+
+            // Resolve 2π ambiguity: find the shift that minimizes the jump
+            while diff > PI {
+                diff -= 2.0 * PI;
+            }
+            while diff <= -PI {
+                diff += 2.0 * PI;
+            }
+
+            self.absolute_phases[i] += diff;
+            self.last_phases[i] = current_phases[i];
+        }
+
+        &self.absolute_phases
+    }
+
+    pub fn reset(&mut self) {
+        self.initialized = false;
+        self.last_phases.clear();
+        self.absolute_phases.clear();
     }
 }
 
@@ -82,6 +138,10 @@ pub struct VitalSignDetector {
     heartbeat_capacity: usize,
     /// Running frame count for signal quality estimation.
     frame_count: u64,
+    /// Phase unwrapper for geometric sensing.
+    phase_unwrapper: PhaseUnwrapper,
+    /// Center frequency in MHz (for wavelength calculation).
+    freq_mhz: f64,
 }
 
 impl VitalSignDetector {
@@ -92,6 +152,11 @@ impl VitalSignDetector {
     /// - Windows WiFi RSSI: 2 Hz (insufficient for heartbeat)
     /// - Simulation: 2-20 Hz
     pub fn new(sample_rate: f64) -> Self {
+        Self::with_freq(sample_rate, 2437.0) // Default to 2.4 GHz Channel 6
+    }
+
+    /// Create a new detector with a specific center frequency.
+    pub fn with_freq(sample_rate: f64, freq_mhz: f64) -> Self {
         let breathing_window_secs = 30.0;
         let heartbeat_window_secs = 15.0;
         let breathing_capacity = (sample_rate * breathing_window_secs) as usize;
@@ -106,6 +171,8 @@ impl VitalSignDetector {
             breathing_capacity: breathing_capacity.max(1),
             heartbeat_capacity: heartbeat_capacity.max(1),
             frame_count: 0,
+            phase_unwrapper: PhaseUnwrapper::new(),
+            freq_mhz,
         }
     }
 
@@ -167,6 +234,23 @@ impl VitalSignDetector {
             self.heartbeat_buffer.pop_front();
         }
 
+        // -- Feature 3: Geometric Displacement --
+        // ADR-018: Resolve 2π ambiguities and track absolute phase.
+        let unwrapped = self.phase_unwrapper.unwrap(phase);
+
+        // Remove common-mode phase offset (CFO) by taking the mean across subcarriers.
+        // For displacement sensing, we track the temporal evolution of this mean.
+        let mean_absolute_phase = if unwrapped.is_empty() { 0.0 } else {
+            unwrapped.iter().sum::<f64>() / unwrapped.len() as f64
+        };
+
+        // Calculate wavelength: λ = c / f
+        let lambda = 299_792_458.0 / (self.freq_mhz * 1_000_000.0);
+
+        // CHCI delta = (λ * Δφ) / (4 * π)
+        // The 4π factor reflects the round-trip signal path modulation.
+        let displacement_mm = (lambda * mean_absolute_phase * 1000.0) / (4.0 * PI);
+
         // -- Extract vital signs --
         let (breathing_rate, breathing_confidence) = self.extract_breathing();
         let (heart_rate, heartbeat_confidence) = self.extract_heartbeat();
@@ -180,6 +264,7 @@ impl VitalSignDetector {
             breathing_confidence,
             heartbeat_confidence,
             signal_quality,
+            displacement_mm,
         }
     }
 
@@ -346,6 +431,7 @@ impl VitalSignDetector {
         self.breathing_buffer.clear();
         self.heartbeat_buffer.clear();
         self.frame_count = 0;
+        self.phase_unwrapper.reset();
     }
 
     /// Current buffer fill levels for diagnostics.
@@ -770,5 +856,54 @@ mod tests {
         let (total, per_frame) = run_benchmark(100);
         assert!(total.as_nanos() > 0);
         assert!(per_frame.as_nanos() > 0);
+    }
+
+    #[test]
+    fn test_geometric_displacement_accuracy() {
+        let sr = 20.0;
+        let freq = 2437.0; // MHz
+        let mut detector = VitalSignDetector::with_freq(sr, freq);
+
+        // Calculate lambda for 2.437 GHz
+        let lambda = 299_792_458.0 / (freq * 1_000_000.0);
+
+        // Target: 1.0 mm displacement
+        let target_mm = 1.0;
+        // delta_phi = (delta_d * 4 * PI) / lambda
+        let delta_phi = (target_mm / 1000.0) * 4.0 * PI / lambda;
+
+        // Frame 1: zero phase
+        let _ = detector.process_frame(&[10.0; 56], &[0.0; 56]);
+
+        // Frame 2: move to target_mm
+        let vitals = detector.process_frame(&[10.0; 56], &[delta_phi; 56]);
+
+        let error = (vitals.displacement_mm - target_mm).abs();
+        assert!(
+            error < 1e-4,
+            "Displacement expected {target_mm}mm, got {:.6}mm (error={error:.6})",
+            vitals.displacement_mm
+        );
+    }
+
+    #[test]
+    fn test_phase_unwrapper_boundary() {
+        let mut unwrapper = PhaseUnwrapper::new();
+
+        // Start at PI - 0.1
+        let p1 = PI - 0.1;
+        unwrapper.unwrap(&[p1]);
+
+        // Jump to -PI + 0.1 (a +0.2 step)
+        let p2 = -PI + 0.1;
+        let abs = unwrapper.unwrap(&[p2]);
+
+        // Absolute phase should be p1 + 0.2 = PI + 0.1
+        let expected = PI + 0.1;
+        assert!(
+            (abs[0] - expected).abs() < 1e-10,
+            "Expected absolute phase {expected}, got {}",
+            abs[0]
+        );
     }
 }

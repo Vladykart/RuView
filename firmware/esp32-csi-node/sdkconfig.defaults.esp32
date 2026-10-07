@@ -1,0 +1,31 @@
+# ESP32 (original) CSI Node — 4MB Flash SDK Configuration
+# For ESP32-D0WD / ESP32-WROOM-32 boards with 4MB flash.
+#
+# Build: idf.py -D SDKCONFIG_DEFAULTS="sdkconfig.defaults.esp32" set-target esp32 && idf.py build
+
+CONFIG_IDF_TARGET="esp32"
+
+# 4MB flash partition table
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_4mb.csv"
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+
+# Compiler: optimize for size (critical for 4MB)
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+
+# CSI support
+CONFIG_ESP_WIFI_CSI_ENABLED=y
+
+# Disable display support (ESP32 has no PSRAM for framebuffer)
+# CONFIG_DISPLAY_ENABLE is not set
+
+# Disable WASM tier 3 (requires PSRAM which ESP32-WROOM doesn't have)
+# CONFIG_WASM_MAX_MODULES is not set
+
+# Reduce logging to save flash
+CONFIG_BOOTLOADER_LOG_LEVEL_WARN=y
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+CONFIG_LWIP_SO_RCVBUF=y
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192

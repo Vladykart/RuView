@@ -1,6 +1,42 @@
 {
+  "permissions": {
+    "allow": [
+      "Bash(chmod +x /home/vlad/.local/bin/ruview-up)",
+      "Bash(/home/vlad/.local/bin/ruview-up)",
+      "Bash(herdr tab *)",
+      "Bash(herdr pane *)",
+      "Bash(python3 -c 'import sys,json; d=json.load\\(sys.stdin\\); [print\\(p.get\\(\"pane_id\"\\), p.get\\(\"label\",\"?\"\\), \"x=%s y=%s w=%s h=%s\" % \\(p.get\\(\"x\"\\),p.get\\(\"y\"\\),p.get\\(\"width\"\\),p.get\\(\"height\"\\)\\)\\) for p in d[\"result\"][\"panes\"]]')",
+      "Bash(chmod +x /home/vlad/.local/bin/ruview-tui-spectrum.py)",
+      "Bash(python3 -)",
+      "Bash(grep -vE '^\\\\s*$')",
+      "Bash(timeout 30 ssh -o BatchMode=yes -o ConnectTimeout=25 srv1834218 'echo SSH-OPEN; find /root/projects /root/kun-agent-workspace/projects /root/ai-dev /root/twps* -maxdepth 5 \\\\\\( -iname \"*room*plan*\" -o -iname \"*floor*plan*\" -o -iname \"*roomplan*\" -o -iname \"*floorplan*\" -o -iname \"*apartment*\" -o -iname \"room.json\" -o -iname \"room.svg\" -o -iname \"*room*.png\" -o -iname \"plan*.png\" -o -iname \"plan*.svg\" \\\\\\) 2>/dev/null | grep -vE \"node_modules|\\\\.git\" | head -20')",
+      "Read(//home/vlad/.local/share/ruview-evidence/**)",
+      "Read(//home/vlad/.config/ruview/**)",
+      "Bash(curl -s -m 120 -w \"\\\\nOTA: HTTP %{http_code}\\\\n\" -X POST -H \"Authorization: Bearer $\\(cat ~/.config/ruview/ota-psk-n2\\)\" --data-binary @build/esp32-csi-node.bin http://192.168.178.38:8032/ota)",
+      "Bash(curl -s -m 8 http://192.168.178.38:8032/ota/diag)",
+      "Bash(systemctl --user restart ruview-web-room)",
+      "Bash(timeout 30 ssh -o BatchMode=yes -o ConnectTimeout=25 srv1834218 'echo SSH-OPEN')",
+      "Bash(mkdir -p ~/.ssh/cm)",
+      "Bash(ssh -o BatchMode=yes -o ConnectTimeout=280 -o ControlMaster=auto -o ControlPath=~/.ssh/cm/%r@%h -o ControlPersist=3600 srv1834218 'echo MASTER-OPEN; hostname')",
+      "Read(//home/vlad/Downloads/**)",
+      "Read(//home/vlad/spatial-observatory/frontend/**)",
+      "Read(//dev/**)",
+      "Bash(lsusb)",
+      "Read(//home/vlad/twps-csi-live/**)",
+      "Bash(timeout 3 tcpdump -i any -nn -c 40 udp port 5005)",
+      "Bash(awk '{print $3}')",
+      "Bash(grep -rhoE \"ws://[^\\\\\"'\\\\` ]+|:8765[^\\\\\"'\\\\` ]*|/ws[a-z/]*\" ui/)",
+      "Bash(ip -4 -o addr show scope global)",
+      "Bash(awk '{print \" \"$2\" \"$4}')",
+      "Bash(arp -n)",
+      "Bash(grep -noE \"ws://[^\\\\\"'\\\\`< ]+|http://[^\\\\\"'\\\\`< ]+|:8080|:8765|:3001|/api/v1/[a-z/]+|/ws/[a-z]+\" index.html app.js)",
+      "Bash(ps -p 3799 -o pid,cmd=)",
+      "Bash(curl -s -o /dev/null -w \" root=%{http_code}\\\\n\" --max-time 3 http://127.0.0.1:4000/)",
+      "Bash(curl -s --max-time 3 http://127.0.0.1:4000/)"
+    ]
+  },
+  "enableAllProjectMcpServers": true,
   "enabledMcpjsonServers": [
     "claude-flow"
-  ],
-  "enableAllProjectMcpServers": true
+  ]
 }

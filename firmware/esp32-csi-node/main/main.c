@@ -152,6 +152,20 @@ void app_main(void)
     }
 #endif
 
+    /* ADR-063: mmWave / AT581x presence sensor. Init early (no network
+     * dependency) so presence is live at boot instead of after the WiFi
+     * connect sequence. */
+    esp_err_t mmwave_ret = mmwave_sensor_init(-1, -1);  /* -1 = default GPIO pins */
+    if (mmwave_ret == ESP_OK) {
+        mmwave_state_t mw;
+        if (mmwave_sensor_get_state(&mw)) {
+            ESP_LOGI(TAG, "mmWave sensor: %s (caps=0x%04x)",
+                     mmwave_type_name(mw.type), mw.capabilities);
+        }
+    } else {
+        ESP_LOGI(TAG, "No mmWave sensor detected (CSI-only mode)");
+    }
+
     /* Initialize WiFi STA (skip entirely under QEMU mock — no RF hardware) */
 #ifndef CONFIG_CSI_MOCK_SKIP_WIFI_CONNECT
     wifi_init_sta();
@@ -242,17 +256,7 @@ void app_main(void)
         }
     }
 
-    /* ADR-063: Initialize mmWave sensor (auto-detect on UART). */
-    esp_err_t mmwave_ret = mmwave_sensor_init(-1, -1);  /* -1 = use default GPIO pins */
-    if (mmwave_ret == ESP_OK) {
-        mmwave_state_t mw;
-        if (mmwave_sensor_get_state(&mw)) {
-            ESP_LOGI(TAG, "mmWave sensor: %s (caps=0x%04x)",
-                     mmwave_type_name(mw.type), mw.capabilities);
-        }
-    } else {
-        ESP_LOGI(TAG, "No mmWave sensor detected (CSI-only mode)");
-    }
+    /* mmWave/AT581x sensor now initialized earlier (right after display). */
 
     /* Initialize power management. */
     power_mgmt_init(g_nvs_config.power_duty);

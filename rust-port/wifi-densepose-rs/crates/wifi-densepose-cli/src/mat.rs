@@ -50,7 +50,7 @@ pub struct ScanArgs {
     pub zone: Option<String>,
 
     /// Disaster type for optimized detection
-    #[arg(short, long, value_enum, default_value = "earthquake")]
+    #[arg(short = 't', long, value_enum, default_value = "earthquake")]
     pub disaster_type: DisasterTypeArg,
 
     /// Detection sensitivity (0.0-1.0)

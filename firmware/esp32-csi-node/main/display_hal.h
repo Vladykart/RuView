@@ -64,6 +64,15 @@ bool display_hal_touch_read(uint16_t *x, uint16_t *y);
  */
 void display_hal_set_brightness(uint8_t percent);
 
+/**
+ * Read battery state from the on-board PMU (StickS3 M5PM1).
+ *
+ * @param[out] mv_out   Battery voltage in millivolts (NULL to skip).
+ * @param[out] pct_out  Battery percent 0-100, 1S-LiPo linear (NULL to skip).
+ * @return ESP_OK on success; ESP_ERR_* if no PMU / not supported on this board.
+ */
+esp_err_t display_hal_battery(uint16_t *mv_out, uint8_t *pct_out);
+
 #ifdef __cplusplus
 }
 #endif
