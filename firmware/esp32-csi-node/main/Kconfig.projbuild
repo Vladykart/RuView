@@ -237,10 +237,13 @@ menu "Mock CSI (QEMU Testing)"
 
     config CSI_MOCK_SKIP_WIFI_CONNECT
         bool "Skip WiFi STA connection"
-        depends on CSI_MOCK_ENABLED
-        default y
+        default y if CSI_MOCK_ENABLED
+        default n
         help
-            Skip WiFi initialization when using mock CSI.
+            Skip WiFi initialization. Default on under mock CSI (QEMU);
+            can also be set alone for an mmWave-only bench build (no CSI
+            capture, no UDP streaming, no OTA — sensor + display + sonar
+            only), e.g. to cut WiFi's current spikes on battery/boost power.
 
     config CSI_MOCK_SCENARIO
         int "Mock scenario (0-9, 255=all)"

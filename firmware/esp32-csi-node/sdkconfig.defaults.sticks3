@@ -53,3 +53,6 @@ CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 
 # LWIP: extended socket options
 CONFIG_LWIP_SO_RCVBUF=y
+
+# Debug: console on USB-serial-JTAG so logs are readable over the USB port
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y

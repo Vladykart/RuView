@@ -23,6 +23,7 @@ typedef enum {
     MMWAVE_TYPE_MR60BHA2  = 1,  /**< Seeed MR60BHA2 (60 GHz, HR + BR). */
     MMWAVE_TYPE_LD2410    = 2,  /**< HLK-LD2410 (24 GHz, presence + range). */
     MMWAVE_TYPE_C1001     = 3,  /**< DFRobot C1001 (60 GHz, presence + fall + HR + BR). */
+    MMWAVE_TYPE_AT581X    = 4,  /**< AirTouch AT581x (5.8 GHz, PRESENCE/motion only). */
     MMWAVE_TYPE_MOCK      = 99, /**< Mock sensor for QEMU testing. */
 } mmwave_type_t;
 

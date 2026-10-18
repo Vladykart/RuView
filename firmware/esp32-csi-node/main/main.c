@@ -29,6 +29,7 @@
 #include "wasm_upload.h"
 #include "display_task.h"
 #include "mmwave_sensor.h"
+#include "audio_beep.h"
 #ifdef CONFIG_CSI_MOCK_ENABLED
 #include "mock_csi.h"
 #endif
@@ -152,6 +153,31 @@ void app_main(void)
     }
 #endif
 
+    /* ADR-063: mmWave / AT581x presence sensor. Init early (no network
+     * dependency) so presence is live at boot instead of after the WiFi
+     * connect sequence. */
+    esp_err_t mmwave_ret = mmwave_sensor_init(-1, -1);  /* -1 = default GPIO pins */
+    if (mmwave_ret == ESP_OK) {
+        mmwave_state_t mw;
+        if (mmwave_sensor_get_state(&mw)) {
+            ESP_LOGI(TAG, "mmWave sensor: %s (caps=0x%04x)",
+                     mmwave_type_name(mw.type), mw.capabilities);
+        }
+    } else {
+        ESP_LOGI(TAG, "No mmWave sensor detected (CSI-only mode)");
+    }
+
+    /* StickS3 proximity sonar: chirps keyed to the C1001 presence/distance.
+     * Needs the display HAL's PM1 I2C bus, so init after display_task_start. */
+#if CONFIG_DISPLAY_STICKS3
+    if (mmwave_ret == ESP_OK) {
+        esp_err_t beep_ret = audio_beep_start();
+        if (beep_ret != ESP_OK) {
+            ESP_LOGW(TAG, "Proximity sonar disabled: %s", esp_err_to_name(beep_ret));
+        }
+    }
+#endif
+
     /* Initialize WiFi STA (skip entirely under QEMU mock — no RF hardware) */
 #ifndef CONFIG_CSI_MOCK_SKIP_WIFI_CONNECT
     wifi_init_sta();
@@ -178,6 +204,10 @@ void app_main(void)
     } else {
         ESP_LOGI(TAG, "Mock CSI active (scenario=%d)", CONFIG_CSI_MOCK_SCENARIO);
     }
+#elif defined(CONFIG_CSI_MOCK_SKIP_WIFI_CONNECT)
+    /* mmWave-only bench build: no WiFi stack, so promiscuous CSI capture
+     * (ESP_ERROR_CHECK on esp_wifi_*) would abort — skip it. */
+    ESP_LOGI(TAG, "No-WiFi build: skipping CSI collector (mmWave-only node)");
 #else
     csi_collector_init();
 #endif
@@ -242,17 +272,7 @@ void app_main(void)
         }
     }
 
-    /* ADR-063: Initialize mmWave sensor (auto-detect on UART). */
-    esp_err_t mmwave_ret = mmwave_sensor_init(-1, -1);  /* -1 = use default GPIO pins */
-    if (mmwave_ret == ESP_OK) {
-        mmwave_state_t mw;
-        if (mmwave_sensor_get_state(&mw)) {
-            ESP_LOGI(TAG, "mmWave sensor: %s (caps=0x%04x)",
-                     mmwave_type_name(mw.type), mw.capabilities);
-        }
-    } else {
-        ESP_LOGI(TAG, "No mmWave sensor detected (CSI-only mode)");
-    }
+    /* mmWave/AT581x sensor now initialized earlier (right after display). */
 
     /* Initialize power management. */
     power_mgmt_init(g_nvs_config.power_duty);

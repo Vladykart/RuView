@@ -11,3 +11,6 @@ dependencies:
 
   ## ILI9341/ILI9342C panel driver (ESP32-S3-BOX-3 older units)
   espressif/esp_lcd_ili9341: "^2"
+
+  ## ES8311 audio codec (StickS3 proximity sonar — audio_beep.c)
+  espressif/es8311: "^1"

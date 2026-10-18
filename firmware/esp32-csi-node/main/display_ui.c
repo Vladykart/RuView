@@ -21,6 +21,8 @@ extern nvs_config_t g_nvs_config;
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "edge_processing.h"
+#include "mmwave_sensor.h"
+#include "display_hal.h"
 
 static const char *TAG = "disp_ui";
 
@@ -59,6 +61,39 @@ static const char *TAG = "disp_ui";
  * =========================================================================*/
 
 #include "esp_netif.h"
+#include <math.h>
+#include "driver/gpio.h"
+#include "audio_beep.h"
+
+/* ---- Mode button: BOOT (GPIO0), the one button wired on every StickS3.
+ * Active-LOW with pull-up; polled in the display task (no ISR), debounced.
+ * Short press toggles STATUS <-> RADAR. ---- */
+#define UI_BTN_GPIO        GPIO_NUM_0
+#define UI_BTN_DEBOUNCE_MS 150
+
+typedef enum { UI_PAGE_STATUS = 0, UI_PAGE_RADAR } ui_page_t;
+static ui_page_t s_ui_page = UI_PAGE_STATUS;
+static lv_obj_t *s_page_status = NULL;
+static lv_obj_t *s_page_radar  = NULL;
+
+/* ---- Radar page geometry (135x240 portrait, sector opens upward) ---- */
+#define RAD_CX        (SCR_W / 2)     /* sensor position, x  */
+#define RAD_CY        148             /* sensor position, y  */
+#define RAD_R_PX      58              /* 6 m full scale      */
+#define RAD_MAX_M     6.0f
+#define RAD_SWEEP_S   2.0f            /* one wiper pass, seconds */
+
+static lv_obj_t *s_rad_sweep   = NULL; /* rotating beam (lv_line)        */
+static lv_obj_t *s_rad_blip    = NULL; /* target dot on the boresight    */
+static lv_obj_t *s_rad_arc     = NULL; /* C1001 range arc (lv_arc)       */
+static lv_obj_t *s_rad_dist    = NULL; /* big distance readout           */
+static lv_obj_t *s_rad_state   = NULL; /* PRESENT / CLEAR / FALL         */
+static lv_obj_t *s_rad_vitals  = NULL; /* "BR 14  HR 62" strip           */
+static lv_obj_t *s_rad_sound   = NULL; /* sonar status line              */
+static lv_obj_t *s_rad_title   = NULL;
+static lv_point_t s_sweep_pts[2];
+static float s_sweep_deg = 180.0f;     /* 180..360, 270 = boresight (up) */
+static float s_sweep_dir = 1.0f;
 
 /* Card / accent palette (matches the approved 135x240 mock) */
 #define CARD_BG      lv_color_make(0x12, 0x12, 0x1A)
@@ -79,6 +114,7 @@ static lv_obj_t *s_lbl_rssi     = NULL;
 static lv_obj_t *s_lbl_ip       = NULL;
 static lv_obj_t *s_lbl_target   = NULL;
 static lv_obj_t *s_lbl_uptime   = NULL;
+static lv_obj_t *s_lbl_batt     = NULL;   /* battery % (top-right) */
 static lv_obj_t *s_wifi_bars[4] = {NULL};
 
 static lv_obj_t *mk_card(lv_obj_t *parent, int x, int y, int w, int h)
@@ -112,6 +148,100 @@ static lv_obj_t *mk_text(lv_obj_t *parent, int x, int y, int w,
     return lbl;
 }
 
+static lv_obj_t *mk_page(lv_obj_t *parent)
+{
+    lv_obj_t *pg = lv_obj_create(parent);
+    lv_obj_set_pos(pg, 0, 0);
+    lv_obj_set_size(pg, SCR_W, SCR_H);
+    lv_obj_set_style_bg_color(pg, COLOR_BG, 0);
+    lv_obj_set_style_bg_opa(pg, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(pg, 0, 0);
+    lv_obj_set_style_radius(pg, 0, 0);
+    lv_obj_set_style_pad_all(pg, 0, 0);
+    lv_obj_clear_flag(pg, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(pg, LV_SCROLLBAR_MODE_OFF);
+    return pg;
+}
+
+/* ---- Radar page: 180° sector, sensor at the bottom center ---- */
+static void create_radar_page(lv_obj_t *pg)
+{
+    s_rad_title = mk_text(pg, PAD + 2, 7, SCR_W - 2 * PAD - 4,
+                          &lv_font_montserrat_14, COLOR_CYAN,
+                          LV_TEXT_ALIGN_LEFT, "RADAR");
+    s_rad_state = mk_text(pg, PAD + 2, 7, SCR_W - 2 * PAD - 4,
+                          &lv_font_montserrat_14, COLOR_TEXT_DIM,
+                          LV_TEXT_ALIGN_RIGHT, "...");
+
+    /* Static range arcs at 2/4/6 m (semicircle: LVGL angles 180..360). */
+    for (int m = 2; m <= 6; m += 2) {
+        int r = (int)(RAD_R_PX * (m / RAD_MAX_M));
+        lv_obj_t *arc = lv_arc_create(pg);
+        lv_obj_set_size(arc, r * 2, r * 2);
+        lv_obj_set_pos(arc, RAD_CX - r, RAD_CY - r);
+        lv_arc_set_bg_angles(arc, 180, 360);
+        lv_arc_set_value(arc, 0);
+        lv_obj_remove_style(arc, NULL, LV_PART_KNOB);
+        lv_obj_remove_style(arc, NULL, LV_PART_INDICATOR);
+        lv_obj_set_style_arc_width(arc, 1, LV_PART_MAIN);
+        lv_obj_set_style_arc_color(arc, CARD_BORDER, LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(arc, LV_OPA_TRANSP, 0);
+        lv_obj_clear_flag(arc, LV_OBJ_FLAG_CLICKABLE);
+        char rl[6];
+        snprintf(rl, sizeof(rl), "%dm", m);
+        mk_text(pg, RAD_CX - 10, RAD_CY - r - 11, 22, &lv_font_montserrat_12,
+                COLOR_TEXT_DIM, LV_TEXT_ALIGN_CENTER, rl);
+    }
+    /* Baseline under the sector */
+    lv_obj_t *base = lv_obj_create(pg);
+    lv_obj_set_pos(base, RAD_CX - RAD_R_PX, RAD_CY);
+    lv_obj_set_size(base, RAD_R_PX * 2 + 1, 1);
+    lv_obj_set_style_bg_color(base, CARD_BORDER, 0);
+    lv_obj_set_style_bg_opa(base, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(base, 0, 0);
+
+    /* C1001 range arc: the sensor reports distance without bearing, so the
+     * honest mark is an arc segment around the boresight, not a point. */
+    s_rad_arc = lv_arc_create(pg);
+    lv_arc_set_bg_angles(s_rad_arc, 245, 295);
+    lv_arc_set_value(s_rad_arc, 0);
+    lv_obj_remove_style(s_rad_arc, NULL, LV_PART_KNOB);
+    lv_obj_remove_style(s_rad_arc, NULL, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_width(s_rad_arc, 3, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(s_rad_arc, COLOR_GREEN, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(s_rad_arc, LV_OPA_TRANSP, 0);
+    lv_obj_clear_flag(s_rad_arc, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(s_rad_arc, LV_OBJ_FLAG_HIDDEN);
+
+    /* Boresight blip */
+    s_rad_blip = lv_obj_create(pg);
+    lv_obj_set_size(s_rad_blip, 7, 7);
+    lv_obj_set_style_radius(s_rad_blip, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(s_rad_blip, COLOR_GREEN, 0);
+    lv_obj_set_style_bg_opa(s_rad_blip, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_rad_blip, 0, 0);
+    lv_obj_add_flag(s_rad_blip, LV_OBJ_FLAG_HIDDEN);
+
+    /* Sweep beam */
+    s_sweep_pts[0].x = RAD_CX; s_sweep_pts[0].y = RAD_CY;
+    s_sweep_pts[1].x = RAD_CX - RAD_R_PX; s_sweep_pts[1].y = RAD_CY;
+    s_rad_sweep = lv_line_create(pg);
+    lv_line_set_points(s_rad_sweep, s_sweep_pts, 2);
+    lv_obj_set_style_line_width(s_rad_sweep, 2, 0);
+    lv_obj_set_style_line_color(s_rad_sweep, COLOR_CYAN, 0);
+    lv_obj_set_style_line_opa(s_rad_sweep, LV_OPA_70, 0);
+
+    /* Data block under the sector: distance, vitals, sonar, controls */
+    s_rad_dist = mk_text(pg, 0, RAD_CY + 8, SCR_W, &lv_font_montserrat_28,
+                         COLOR_TEXT, LV_TEXT_ALIGN_CENTER, "--.-");
+    s_rad_vitals = mk_text(pg, 0, RAD_CY + 42, SCR_W, &lv_font_montserrat_12,
+                           COLOR_TEXT_DIM, LV_TEXT_ALIGN_CENTER, "BR --  HR --");
+    s_rad_sound = mk_text(pg, 0, RAD_CY + 58, SCR_W, &lv_font_montserrat_12,
+                          COLOR_TEXT_DIM, LV_TEXT_ALIGN_CENTER, LV_SYMBOL_VOLUME_MAX " --");
+    mk_text(pg, 0, SCR_H - 16, SCR_W, &lv_font_montserrat_12, COLOR_TEXT_DIM,
+            LV_TEXT_ALIGN_CENTER, "BOOT: page " LV_SYMBOL_BULLET " hold: mute");
+}
+
 void display_ui_create(lv_obj_t *parent)
 {
     lv_obj_set_style_bg_color(parent, COLOR_BG, 0);
@@ -119,11 +249,30 @@ void display_ui_create(lv_obj_t *parent)
     lv_obj_clear_flag(parent, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scrollbar_mode(parent, LV_SCROLLBAR_MODE_OFF);
 
+    /* Two pages toggled by the BOOT button: status card | radar sector. */
+    s_page_status = mk_page(parent);
+    s_page_radar  = mk_page(parent);
+    create_radar_page(s_page_radar);
+    lv_obj_add_flag(s_page_radar, LV_OBJ_FLAG_HIDDEN);
+
+    gpio_config_t btn = {
+        .pin_bit_mask = 1ULL << UI_BTN_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+    };
+    gpio_config(&btn);
+
+    parent = s_page_status;  /* the status widgets below live on page 0 */
+
     /* ---- Header: node identity, hairline below ---- */
     char node[12];
     snprintf(node, sizeof(node), "NODE %d", g_nvs_config.node_id);
     mk_text(parent, PAD + 2, 7, SCR_W - 2 * PAD - 4, &lv_font_montserrat_14,
             COLOR_CYAN, LV_TEXT_ALIGN_LEFT, node);
+    /* Battery % — right-aligned on the header row (populated in update). */
+    s_lbl_batt = mk_text(parent, PAD + 2, 7, SCR_W - 2 * PAD - 4,
+                         &lv_font_montserrat_14, COLOR_TEXT_DIM,
+                         LV_TEXT_ALIGN_RIGHT, "");
     lv_obj_t *rule = lv_obj_create(parent);
     lv_obj_set_pos(rule, PAD + 2, 26);
     lv_obj_set_size(rule, CARD_W - 4, 1);
@@ -186,13 +335,148 @@ void display_ui_create(lv_obj_t *parent)
     ESP_LOGI(TAG, "UI created: StickS3 card status view");
 }
 
+/* Poll the BOOT button (active-LOW). Runs in the display task, so LVGL calls
+ * are safe here. Short press (< 800 ms) toggles pages; long press toggles the
+ * proximity-sonar mute. */
+#define UI_BTN_LONG_MS 800
+
+static void ui_toggle_page(void)
+{
+    s_ui_page = (s_ui_page == UI_PAGE_STATUS) ? UI_PAGE_RADAR : UI_PAGE_STATUS;
+    if (s_ui_page == UI_PAGE_RADAR) {
+        lv_obj_clear_flag(s_page_radar, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_page_status, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_clear_flag(s_page_status, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_page_radar, LV_OBJ_FLAG_HIDDEN);
+    }
+    ESP_LOGI(TAG, "UI page -> %s", s_ui_page == UI_PAGE_RADAR ? "radar" : "status");
+}
+
+static void ui_poll_button(uint32_t now_ms)
+{
+    static uint32_t s_press_ms = 0;
+    static int s_prev = 1;
+    static bool s_long_fired = false;
+    int lvl = gpio_get_level(UI_BTN_GPIO);
+    if (lvl == 0 && s_prev == 1) {                       /* press edge   */
+        s_press_ms = now_ms;
+        s_long_fired = false;
+    } else if (lvl == 0 && !s_long_fired &&
+               now_ms - s_press_ms >= UI_BTN_LONG_MS) {  /* held long    */
+        s_long_fired = true;
+        audio_beep_toggle_mute();
+    } else if (lvl == 1 && s_prev == 0 && !s_long_fired &&
+               now_ms - s_press_ms >= UI_BTN_DEBOUNCE_MS / 3) { /* short release */
+        ui_toggle_page();
+    }
+    s_prev = lvl;
+}
+
+/* Sweep beam: full-frame-rate wiper across the sector. */
+static void ui_radar_sweep(uint32_t now_ms)
+{
+    static uint32_t s_prev_ms = 0;
+    float dt = s_prev_ms ? (now_ms - s_prev_ms) / 1000.0f : 0;
+    s_prev_ms = now_ms;
+    s_sweep_deg += s_sweep_dir * dt * (180.0f / RAD_SWEEP_S);
+    if (s_sweep_deg >= 358.0f) { s_sweep_deg = 358.0f; s_sweep_dir = -1.0f; }
+    if (s_sweep_deg <= 182.0f) { s_sweep_deg = 182.0f; s_sweep_dir = 1.0f; }
+    float a = s_sweep_deg * (float)M_PI / 180.0f;
+    s_sweep_pts[1].x = RAD_CX + (lv_coord_t)(cosf(a) * RAD_R_PX);
+    s_sweep_pts[1].y = RAD_CY + (lv_coord_t)(sinf(a) * RAD_R_PX);
+    lv_line_set_points(s_rad_sweep, s_sweep_pts, 2);
+}
+
+/* Radar page data: C1001 presence/range/vitals at 2 Hz. */
+static void ui_radar_data(void)
+{
+    char buf[40];
+    mmwave_state_t mw;
+    bool has_mw = mmwave_sensor_get_state(&mw);
+    snprintf(buf, sizeof(buf), "RADAR n%d%s", g_nvs_config.node_id,
+             audio_beep_muted() ? " " LV_SYMBOL_MUTE : "");
+    lv_label_set_text(s_rad_title, buf);
+
+    if (has_mw && mw.fall_detected) {
+        lv_label_set_text(s_rad_state, "FALL!");
+        lv_obj_set_style_text_color(s_rad_state, COLOR_RED, 0);
+    } else if (has_mw && mw.person_present) {
+        snprintf(buf, sizeof(buf), "PRESENT x%u", (unsigned)(mw.target_count ? mw.target_count : 1));
+        lv_label_set_text(s_rad_state, buf);
+        lv_obj_set_style_text_color(s_rad_state, COLOR_GREEN, 0);
+    } else {
+        lv_label_set_text(s_rad_state, has_mw ? "CLEAR" : "no radar");
+        lv_obj_set_style_text_color(s_rad_state, COLOR_TEXT_DIM, 0);
+    }
+
+    /* Sonar status: live chirp cadence/tone, muted, or idle */
+    audio_beep_status_t snd;
+    audio_beep_get_status(&snd);
+    if (!snd.ready) {
+        lv_label_set_text(s_rad_sound, LV_SYMBOL_MUTE " no audio");
+        lv_obj_set_style_text_color(s_rad_sound, COLOR_TEXT_DIM, 0);
+    } else if (snd.muted) {
+        lv_label_set_text(s_rad_sound, LV_SYMBOL_MUTE " muted (hold BOOT)");
+        lv_obj_set_style_text_color(s_rad_sound, COLOR_AMBER, 0);
+    } else if (snd.chirping) {
+        snprintf(buf, sizeof(buf), LV_SYMBOL_VOLUME_MAX " %.2fs @ %.1fkHz",
+                 (double)snd.interval_s, (double)(snd.tone_hz / 1000.0f));
+        lv_label_set_text(s_rad_sound, buf);
+        lv_obj_set_style_text_color(s_rad_sound, COLOR_CYAN, 0);
+    } else {
+        lv_label_set_text(s_rad_sound, LV_SYMBOL_VOLUME_MID " armed " LV_SYMBOL_BULLET " silent");
+        lv_obj_set_style_text_color(s_rad_sound, COLOR_TEXT_DIM, 0);
+    }
+
+    bool show = has_mw && mw.person_present && mw.distance_cm > 0;
+    if (show) {
+        float d_m = mw.distance_cm / 100.0f;
+        if (d_m > RAD_MAX_M) d_m = RAD_MAX_M;
+        int r = (int)(RAD_R_PX * (d_m / RAD_MAX_M));
+        if (r < 4) r = 4;
+        lv_obj_set_size(s_rad_arc, r * 2, r * 2);
+        lv_obj_set_pos(s_rad_arc, RAD_CX - r, RAD_CY - r);
+        lv_obj_clear_flag(s_rad_arc, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_pos(s_rad_blip, RAD_CX - 3, RAD_CY - r - 3);
+        lv_obj_clear_flag(s_rad_blip, LV_OBJ_FLAG_HIDDEN);
+        lv_color_t c = mw.fall_detected ? COLOR_RED : COLOR_GREEN;
+        lv_obj_set_style_arc_color(s_rad_arc, c, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(s_rad_blip, c, 0);
+        snprintf(buf, sizeof(buf), "%.2fm", (double)(mw.distance_cm / 100.0f));
+        lv_label_set_text(s_rad_dist, buf);
+        lv_obj_set_style_text_color(s_rad_dist, COLOR_TEXT, 0);
+    } else {
+        lv_obj_add_flag(s_rad_arc, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_rad_blip, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(s_rad_dist, "--.-");
+        lv_obj_set_style_text_color(s_rad_dist, COLOR_TEXT_DIM, 0);
+    }
+
+    if (has_mw && mw.person_present &&
+        (mw.breathing_rate > 0 || mw.heart_rate_bpm > 0)) {
+        snprintf(buf, sizeof(buf), "BR %.0f  HR %.0f",
+                 (double)mw.breathing_rate, (double)mw.heart_rate_bpm);
+        lv_label_set_text(s_rad_vitals, buf);
+        lv_obj_set_style_text_color(s_rad_vitals, COLOR_CYAN, 0);
+    } else {
+        lv_label_set_text(s_rad_vitals, "BR --  HR --");
+        lv_obj_set_style_text_color(s_rad_vitals, COLOR_TEXT_DIM, 0);
+    }
+}
+
 void display_ui_update(void)
 {
-    /* Refresh at 2 Hz — rendering stays cheap between updates */
-    static uint32_t s_last_ms = 0;
     uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    ui_poll_button(now_ms);
+    if (s_ui_page == UI_PAGE_RADAR) ui_radar_sweep(now_ms);
+
+    /* Data refresh at 2 Hz — rendering stays cheap between updates */
+    static uint32_t s_last_ms = 0;
     if (now_ms - s_last_ms < 500) return;
     s_last_ms = now_ms;
+
+    if (s_ui_page == UI_PAGE_RADAR) { ui_radar_data(); return; }
 
     char buf[40];
 
@@ -221,31 +505,33 @@ void display_ui_update(void)
     edge_vitals_pkt_t vitals;
     bool has_vitals = edge_get_vitals(&vitals);
 
-    /* ---- Hero presence state ---- */
-    if (!has_ip && g_nvs_config.wifi_ssid[0] != '\0') {
+    /* ---- Hero presence state (AT581x radar + CSI edge, works offline) ---- */
+    mmwave_state_t mw;
+    bool has_mw = mmwave_sensor_get_state(&mw);
+    bool present = (has_vitals && ((vitals.flags & 0x01) || vitals.n_persons > 0))
+                   || (has_mw && mw.person_present);
+    if (present) {
+        lv_label_set_text(s_lbl_state, "OCCUPIED");
+        lv_obj_set_style_text_color(s_lbl_state, COLOR_GREEN, 0);
+        lv_obj_set_style_border_color(s_hero_card, COLOR_GREEN, 0);
+        if (has_vitals && vitals.n_persons > 1)
+            snprintf(buf, sizeof(buf), "%u persons", vitals.n_persons);
+        else
+            snprintf(buf, sizeof(buf), "1 person");
+        lv_label_set_text(s_lbl_substate, buf);
+        lv_obj_set_style_text_color(s_lbl_substate, COLOR_GREEN, 0);
+    } else if (!has_ip && g_nvs_config.wifi_ssid[0] != '\0' && !has_mw) {
+        /* Only show JOINING when there's no local sensor to report presence. */
         lv_label_set_text(s_lbl_state, "JOINING");
         lv_obj_set_style_text_color(s_lbl_state, COLOR_AMBER, 0);
         lv_label_set_text(s_lbl_substate, g_nvs_config.wifi_ssid);
         lv_obj_set_style_border_color(s_hero_card, CARD_BORDER, 0);
-    } else if (has_vitals) {
-        bool present = (vitals.flags & 0x01) || vitals.n_persons > 0;
-        if (present) {
-            lv_label_set_text(s_lbl_state, "OCCUPIED");
-            lv_obj_set_style_text_color(s_lbl_state, COLOR_GREEN, 0);
-            lv_obj_set_style_border_color(s_hero_card, COLOR_GREEN, 0);
-            if (vitals.n_persons > 1)
-                snprintf(buf, sizeof(buf), "%u persons", vitals.n_persons);
-            else
-                snprintf(buf, sizeof(buf), "1 person");
-            lv_label_set_text(s_lbl_substate, buf);
-            lv_obj_set_style_text_color(s_lbl_substate, COLOR_GREEN, 0);
-        } else {
-            lv_label_set_text(s_lbl_state, "EMPTY");
-            lv_obj_set_style_text_color(s_lbl_state, COLOR_TEXT_DIM, 0);
-            lv_obj_set_style_border_color(s_hero_card, CARD_BORDER, 0);
-            lv_label_set_text(s_lbl_substate, "watching");
-            lv_obj_set_style_text_color(s_lbl_substate, COLOR_TEXT_DIM, 0);
-        }
+    } else {
+        lv_label_set_text(s_lbl_state, "EMPTY");
+        lv_obj_set_style_text_color(s_lbl_state, COLOR_TEXT_DIM, 0);
+        lv_obj_set_style_border_color(s_hero_card, CARD_BORDER, 0);
+        lv_label_set_text(s_lbl_substate, has_mw ? mmwave_type_name(mw.type) : "watching");
+        lv_obj_set_style_text_color(s_lbl_substate, COLOR_TEXT_DIM, 0);
     }
 
     /* ---- Vitals ---- */
@@ -279,6 +565,20 @@ void display_ui_update(void)
                 vitals.rssi >= thresh[i] ? COLOR_CYAN : BAR_OFF, 0);
         }
     }
+
+#if CONFIG_DISPLAY_STICKS3
+    /* ---- Battery (M5PM1 PMU), refreshed ~every 3 s ---- */
+    static int s_batt_div = 0;
+    if (s_lbl_batt && (s_batt_div++ % 30) == 0) {
+        uint8_t bpct = 0;
+        if (display_hal_battery(NULL, &bpct) == ESP_OK) {
+            snprintf(buf, sizeof(buf), "%u%%", (unsigned)bpct);
+            lv_label_set_text(s_lbl_batt, buf);
+            lv_color_t bc = bpct > 50 ? COLOR_GREEN : (bpct > 20 ? COLOR_AMBER : COLOR_RED);
+            lv_obj_set_style_text_color(s_lbl_batt, bc, 0);
+        }
+    }
+#endif
 
     /* ---- Uptime ---- */
     uint32_t up_min = now_ms / 60000;

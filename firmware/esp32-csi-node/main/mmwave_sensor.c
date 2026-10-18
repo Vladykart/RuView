@@ -537,6 +537,11 @@ static mmwave_type_t probe_at_baud(uint32_t baud)
         if (len <= 0) continue;
 
         for (int i = 0; i < len; i++) {
+            /* C1001 SY framing heard passively (e.g. a late reply to an
+             * earlier probe query): definitive — never call it MR60. */
+            if (i + 1 < len && buf[i] == C1001_HDR0 && buf[i + 1] == C1001_HDR1) {
+                return MMWAVE_TYPE_C1001;
+            }
             /* MR60BHA2: SOF = 0x01, followed by valid-looking frame_id bytes */
             if (buf[i] == MR60_SOF && baud == MMWAVE_MR60_BAUD) {
                 mr60_sof_seen++;
@@ -624,16 +629,19 @@ static mmwave_type_t probe_c1001_at(uint32_t baud)
  */
 static mmwave_type_t probe_sensor(void)
 {
+    /* C1001 FIRST: its query/response handshake is definitive (a valid SY
+     * reply to OUR query). The passive MR60 heuristic counts bare 0x01
+     * bytes and used to misdetect a chatty C1001 as MR60BHA2. */
+    ESP_LOGI(TAG, "Probing at %d baud (C1001, active query)...", C1001_BAUD);
+    mmwave_type_t result = probe_c1001();
+    if (result != MMWAVE_TYPE_NONE) return result;
+
     ESP_LOGI(TAG, "Probing at %d baud (MR60BHA2)...", MMWAVE_MR60_BAUD);
-    mmwave_type_t result = probe_at_baud(MMWAVE_MR60_BAUD);
+    result = probe_at_baud(MMWAVE_MR60_BAUD);
     if (result != MMWAVE_TYPE_NONE) return result;
 
     ESP_LOGI(TAG, "Probing at %d baud (LD2410)...", MMWAVE_LD2410_BAUD);
     result = probe_at_baud(MMWAVE_LD2410_BAUD);
-    if (result != MMWAVE_TYPE_NONE) return result;
-
-    ESP_LOGI(TAG, "Probing at %d baud (C1001, active query)...", C1001_BAUD);
-    result = probe_c1001();
     return result;
 }
 
@@ -863,10 +871,82 @@ const char *mmwave_type_name(mmwave_type_t type)
     case MMWAVE_TYPE_MR60BHA2: return "MR60BHA2";
     case MMWAVE_TYPE_LD2410:   return "LD2410";
     case MMWAVE_TYPE_C1001:    return "C1001";
+    case MMWAVE_TYPE_AT581X:   return "AT581x";
     case MMWAVE_TYPE_MOCK:     return "Mock";
     case MMWAVE_TYPE_NONE:
     default:                   return "None";
     }
+}
+
+/* ===================================================================== */
+/* AT581x 5.8 GHz micro-motion PRESENCE radar (ESP32-S3-BOX-3-SENSOR dock) */
+/*                                                                         */
+/* The AT581x is a presence/motion sensor ONLY — it has no heart-rate or   */
+/* breathing capability. On the BOX-3-SENSOR dock it drives a digital      */
+/* presence OUT line on GPIO21 (I2C on GPIO40/41, shared with the AHT30,    */
+/* only tunes thresholds). We read the OUT line directly at the module's    */
+/* default sensitivity and feed the shared mmWave state so the LCD and      */
+/* edge reporting show presence with zero extra wiring.                     */
+/* ===================================================================== */
+#define AT581X_PRESENCE_GPIO   21
+#define AT581X_POLL_MS         100
+#define AT581X_HOLD_MS         1500   /* hold "present" this long after last HIGH */
+
+static void at581x_task(void *arg)
+{
+    (void)arg;
+    int64_t last_high_us = 0;
+    bool last_present = false;
+    while (s_running) {
+        int64_t now = esp_timer_get_time();
+        if (gpio_get_level(AT581X_PRESENCE_GPIO)) last_high_us = now;
+        bool present = (now - last_high_us) < (int64_t)AT581X_HOLD_MS * 1000;
+        s_state.person_present = present;
+        s_state.target_count = present ? 1 : 0;
+        s_state.distance_cm = 0.0f;   /* AT581x gives no range */
+        s_state.frame_count++;
+        s_state.last_update_us = now;
+        if (present != last_present) {
+            ESP_LOGI(TAG, "AT581x presence: %s", present ? "DETECTED" : "clear");
+            last_present = present;
+        }
+        vTaskDelay(pdMS_TO_TICKS(AT581X_POLL_MS));
+    }
+    vTaskDelete(NULL);
+}
+
+static esp_err_t at581x_presence_init(void)
+{
+    gpio_config_t io = {
+        .pin_bit_mask = 1ULL << AT581X_PRESENCE_GPIO,
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,  /* idle LOW when nothing detected */
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    esp_err_t err = gpio_config(&io);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "AT581x GPIO%d config failed: %s",
+                 AT581X_PRESENCE_GPIO, esp_err_to_name(err));
+        return err;
+    }
+    s_state.type          = MMWAVE_TYPE_AT581X;
+    s_state.detected      = true;
+    s_state.capabilities  = MMWAVE_CAP_PRESENCE;
+    s_state.heart_rate_bpm = 0.0f;   /* not capable */
+    s_state.breathing_rate = 0.0f;   /* not capable */
+    s_state.last_update_us = esp_timer_get_time();
+    ESP_LOGI(TAG, "AT581x 5.8GHz presence radar active on GPIO%d "
+             "(presence/motion only — no HR/BR)", AT581X_PRESENCE_GPIO);
+    BaseType_t r = xTaskCreatePinnedToCore(
+        at581x_task, "at581x", MMWAVE_TASK_STACK, NULL,
+        MMWAVE_TASK_PRIORITY, NULL, 0);
+    if (r != pdPASS) {
+        ESP_LOGE(TAG, "AT581x task create failed");
+        s_state.detected = false;
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
 }
 
 esp_err_t mmwave_sensor_init(int uart_tx_pin, int uart_rx_pin)
@@ -892,6 +972,15 @@ esp_err_t mmwave_sensor_init(int uart_tx_pin, int uart_rx_pin)
     return ESP_OK;
 
 #else
+#if CONFIG_DISPLAY_S3BOX3
+    /* ESP32-S3-BOX-3-SENSOR dock: the onboard radar is an AT581x 5.8 GHz
+     * presence sensor (not a UART vitals radar). Use it directly, unless the
+     * caller passed explicit UART pins for an external MR60/C1001/LD2410. */
+    if (uart_tx_pin < 0 && uart_rx_pin < 0) {
+        if (at581x_presence_init() == ESP_OK) return ESP_OK;
+        ESP_LOGW(TAG, "AT581x init failed — falling back to UART sensor probe");
+    }
+#endif
     /* Candidate (TX, RX) pin pairs. On the StickS3 the sensor hangs off the
      * Grove PORT.A connector (G9/G10) with unknown orientation; other boards
      * use the legacy UART1 pins 17/18. Explicit pins override the list. */
