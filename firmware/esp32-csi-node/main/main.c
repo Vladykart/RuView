@@ -28,6 +28,9 @@
 #include "wasm_runtime.h"
 #include "wasm_upload.h"
 #include "display_task.h"
+#if CONFIG_DISPLAY_STICKS3
+#include "display_ui.h"
+#endif
 #include "mmwave_sensor.h"
 #include "audio_beep.h"
 #ifdef CONFIG_CSI_MOCK_ENABLED
@@ -116,6 +119,13 @@ static void wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
+#if CONFIG_DISPLAY_STICKS3
+    /* StickS3 runs from a 250 mAh cell that also feeds the sensor's 5 V boost:
+     * full TX power (~20 dBm) current spikes brown it out. 11 dBm is plenty
+     * indoors and roughly halves the peak draw. Units: 0.25 dBm. */
+    esp_wifi_set_max_tx_power(44);
+#endif
+
     ESP_LOGI(TAG, "WiFi STA initialized, connecting to SSID: %s", g_nvs_config.wifi_ssid);
 
     /* Wait for connection */
@@ -153,6 +163,12 @@ void app_main(void)
     }
 #endif
 
+#if CONFIG_DISPLAY_STICKS3
+    /* Power the sensor's 5 V rail first, before the probe below drives its
+     * UART — see display_ui_sensor_power_boot(). */
+    if (disp_ret == ESP_OK) display_ui_sensor_power_boot();
+#endif
+
     /* ADR-063: mmWave / AT581x presence sensor. Init early (no network
      * dependency) so presence is live at boot instead of after the WiFi
      * connect sequence. */
@@ -167,14 +183,14 @@ void app_main(void)
         ESP_LOGI(TAG, "No mmWave sensor detected (CSI-only mode)");
     }
 
-    /* StickS3 proximity sonar: chirps keyed to the C1001 presence/distance.
-     * Needs the display HAL's PM1 I2C bus, so init after display_task_start. */
+    /* StickS3 proximity sonar + fall alarm, keyed to the C1001 state. Start it
+     * even when no sensor answered yet: the sensor is powered later by the
+     * battery policy and found by the deferred probe. Needs the display HAL's
+     * PM1 I2C bus, so init after display_task_start. */
 #if CONFIG_DISPLAY_STICKS3
-    if (mmwave_ret == ESP_OK) {
-        esp_err_t beep_ret = audio_beep_start();
-        if (beep_ret != ESP_OK) {
-            ESP_LOGW(TAG, "Proximity sonar disabled: %s", esp_err_to_name(beep_ret));
-        }
+    esp_err_t beep_ret = audio_beep_start();
+    if (beep_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Proximity sonar disabled: %s", esp_err_to_name(beep_ret));
     }
 #endif
 

@@ -34,6 +34,7 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "nvs.h"
 #include "sdkconfig.h"
 
 #ifndef CONFIG_CSI_MOCK_ENABLED
@@ -78,15 +79,36 @@ static const char *TAG = "mmwave";
 #define C1001_HDR1          0x59
 #define C1001_TAIL0         0x54
 #define C1001_TAIL1         0x43
-#define C1001_CON_STATUS    0x80  /* cmd 0x81 presence, 0x82 motion */
+#define C1001_CON_STATUS    0x80  /* cmd 0x81 presence, 0x82 motion, 0x84 distance (2B BE, cm) */
 #define C1001_CON_BREATH    0x81  /* cmd 0x82 breathing rate */
 #define C1001_CON_FALL      0x83  /* cmd 0x81 fall state */
 #define C1001_CON_HEART     0x85  /* cmd 0x82 heart rate */
+#define C1001_CON_MODE      0x02  /* cmd 0xA8 set work mode: data 0x00 sleep, 0x01 fall */
+#define C1001_CMD_DISTANCE  0x84  /* sleep mode: target distance, 2B BE cm        */
+#define C1001_CMD_SEAT_DIST 0x8D  /* fall mode: seated detection RANGE setting (not a reading) */
+#define C1001_CMD_MOVE_DIST 0x8E  /* fall mode: motion detection RANGE setting (not a reading) */
+#define C1001_CMD_TRACK     0x8E  /* con 0x83 (fall): track point x,y int16 BE ×2 */
+#define C1001_CMD_SETMODE   0xA8
+#define C1001_MODE_SLEEP    MMWAVE_C1001_MODE_VITALS
+#define C1001_MODE_FALL     MMWAVE_C1001_MODE_FALL
 #define C1001_MAX_DATA      40
 
 /* ---- Shared state ---- */
 static mmwave_state_t s_state;
 static volatile bool s_running;
+
+/* C1001 work mode: current, and a pending request from another task (the
+ * UART task owns the port, so it applies the change). 0xFF = none pending. */
+static volatile uint8_t s_c1001_mode = MMWAVE_C1001_MODE_FALL;
+static volatile uint8_t s_c1001_mode_req = 0xFF;
+
+uint8_t mmwave_c1001_get_mode(void) { return s_c1001_mode; }
+
+void mmwave_c1001_set_mode(uint8_t mode)
+{
+    if (mode != MMWAVE_C1001_MODE_VITALS && mode != MMWAVE_C1001_MODE_FALL) return;
+    s_c1001_mode_req = mode;
+}
 
 /* Diagnostic transcript kept in RAM so headless nodes can serve it
  * remotely (GET /ota/diag). */
@@ -373,16 +395,61 @@ typedef struct {
 static c1001_parser_t s_c1001;
 
 #ifndef CONFIG_CSI_MOCK_ENABLED
-static void c1001_send_query(uint8_t con, uint8_t cmd)
+/* One-byte-payload frame. 0x0F is the DFRobot "request/read" magic; a set
+ * command (e.g. work mode) passes the value to write instead. */
+static void c1001_send(uint8_t con, uint8_t cmd, uint8_t data)
 {
-    uint8_t frame[10] = { C1001_HDR0, C1001_HDR1, con, cmd, 0x00, 0x01, 0x0F,
+    uint8_t frame[10] = { C1001_HDR0, C1001_HDR1, con, cmd, 0x00, 0x01, data,
                           0, C1001_TAIL0, C1001_TAIL1 };
     uint16_t sum = 0;
     for (int i = 0; i < 7; i++) sum += frame[i];
     frame[7] = (uint8_t)(sum & 0xFF);
     uart_write_bytes(MMWAVE_UART_NUM, frame, sizeof(frame));
 }
+
+static void c1001_send_query(uint8_t con, uint8_t cmd)
+{
+    c1001_send(con, cmd, 0x0F);
+}
+
+/* Switch the C1001 work mode (UART task only). Values that only the other
+ * mode produces are cleared so the UI never shows stale vitals or a stale
+ * fall. Sent a few times since the sensor may be busy. */
+static void c1001_apply_mode(uint8_t mode, bool save)
+{
+    for (int i = 0; i < 3; i++) {
+        c1001_send(C1001_CON_MODE, C1001_CMD_SETMODE, mode);
+        vTaskDelay(pdMS_TO_TICKS(120));
+    }
+    s_c1001_mode = mode;
+    s_state.distance_cm = 0;
+    s_state.track_valid = false;
+    if (mode == MMWAVE_C1001_MODE_FALL) {
+        s_state.breathing_rate = 0;
+        s_state.heart_rate_bpm = 0;
+    } else {
+        s_state.fall_detected = false;
+    }
+    if (save) {
+        nvs_handle_t h;
+        if (nvs_open("csi_cfg", NVS_READWRITE, &h) == ESP_OK) {
+            nvs_set_u8(h, "mw_mode", mode);
+            nvs_commit(h);
+            nvs_close(h);
+        }
+    }
+    ESP_LOGI(TAG, "C1001 work mode set: %s%s",
+             mode == MMWAVE_C1001_MODE_FALL ? "FALL (presence+distance+fall)"
+                                            : "VITALS (presence+distance+breathing+heart)",
+             save ? " (saved)" : "");
+}
 #endif
+
+/* Ring of the last received frames, dumped as an "MWD" console line so the
+ * real on-wire con/cmd/data can be checked against the protocol. */
+#define C1001_DBG_N 8
+static struct { uint8_t con, cmd, d0, d1; uint16_t len; } s_c1001_dbg[C1001_DBG_N];
+static int s_c1001_dbg_idx = 0;
 
 static void c1001_process_frame(uint8_t con, uint8_t cmd,
                                 const uint8_t *data, uint16_t len)
@@ -391,17 +458,46 @@ static void c1001_process_frame(uint8_t con, uint8_t cmd,
     s_state.frame_count++;
     s_state.last_update_us = esp_timer_get_time();
 
+    s_c1001_dbg[s_c1001_dbg_idx].con = con;
+    s_c1001_dbg[s_c1001_dbg_idx].cmd = cmd;
+    s_c1001_dbg[s_c1001_dbg_idx].len = len;
+    s_c1001_dbg[s_c1001_dbg_idx].d0 = data[0];
+    s_c1001_dbg[s_c1001_dbg_idx].d1 = len > 1 ? data[1] : 0;
+    s_c1001_dbg_idx = (s_c1001_dbg_idx + 1) % C1001_DBG_N;
+
+    /* Query replies carry cmd|0x80; in sleep mode the sensor also pushes
+     * unsolicited reports with the bare cmd (0x01, 0x02, 0x04 ...). Treat
+     * both the same. */
+    cmd |= 0x80;
+
     if (con == C1001_CON_STATUS && cmd == 0x81) {
         s_state.person_present = (data[0] != 0);
         s_state.target_count = (data[0] != 0) ? 1 : 0;
     } else if (con == C1001_CON_STATUS && cmd == 0x82) {
         /* Motion: 0=none, 1=static, 2=active — presence handled above. */
+    } else if (con == C1001_CON_STATUS && cmd == C1001_CMD_DISTANCE) {
+        /* Sleep mode target distance: 2 bytes big-endian, cm. */
+        if (len >= 2) s_state.distance_cm = (float)(((uint16_t)data[0] << 8) | data[1]);
     } else if (con == C1001_CON_BREATH && cmd == 0x82) {
         if (data[0] > 0 && data[0] <= 60) s_state.breathing_rate = (float)data[0];
     } else if (con == C1001_CON_HEART && cmd == 0x82) {
         if (data[0] > 0 && data[0] <= 250) s_state.heart_rate_bpm = (float)data[0];
     } else if (con == C1001_CON_FALL && cmd == 0x81) {
         s_state.fall_detected = (data[0] != 0);
+    } else if (con == C1001_CON_FALL && cmd == C1001_CMD_TRACK) {
+        /* Track point (DFRobot track()): x = buf[6..7], y = buf[8..9], BE.
+         * Signed, cm. All-zero means no target to track. */
+        if (len >= 4) {
+            int16_t x = (int16_t)(((uint16_t)data[0] << 8) | data[1]);
+            int16_t y = (int16_t)(((uint16_t)data[2] << 8) | data[3]);
+            s_state.track_x_cm = x;
+            s_state.track_y_cm = y;
+            s_state.track_valid = (x != 0 || y != 0);
+            s_state.track_us = esp_timer_get_time();
+            /* In fall mode the track point is the only measured position. */
+            s_state.distance_cm = s_state.track_valid
+                ? sqrtf((float)x * x + (float)y * y) : 0.0f;
+        }
     }
 }
 
@@ -652,24 +748,106 @@ static void mmwave_uart_task(void *arg)
              mmwave_type_name(s_state.type));
 
     uint8_t buf[128];
-    /* C1001 is query/response: round-robin one query per 200 ms so each
-     * metric refreshes at ~1 Hz. */
-    static const uint8_t c1001_queries[][2] = {
-        { C1001_CON_STATUS, 0x81 },  /* presence  */
-        { C1001_CON_STATUS, 0x82 },  /* motion    */
-        { C1001_CON_BREATH, 0x82 },  /* breathing */
-        { C1001_CON_HEART,  0x82 },  /* heart     */
-        { C1001_CON_FALL,   0x81 },  /* fall      */
+    /* C1001 is query/response: round-robin one query per 200 ms. Its two work
+     * modes expose different data (DFRobot_HumanDetection: smHumanData vs
+     * dmHumanData/getFallData), so each mode has its own query table. */
+    static const uint8_t q_vitals[][2] = {
+        { C1001_CON_STATUS, 0x81 },                /* presence  */
+        { C1001_CON_STATUS, C1001_CMD_DISTANCE },  /* distance  */
+        { C1001_CON_BREATH, 0x82 },                /* breathing */
+        { C1001_CON_HEART,  0x82 },                /* heart     */
+    };
+    /* Fall mode: the track point is the position (and so the distance);
+     * queried every other slot (~3 Hz at 150 ms). Fall state twice per cycle
+     * so an alarm is never more than ~0.6 s late. NOTE: 0x80/0x8D and
+     * 0x80/0x8E are the configured seated/motion detection RANGES, not a
+     * measured distance — they read 200/300 cm with nobody present. */
+    static const uint8_t q_fall[][2] = {
+        { C1001_CON_STATUS, 0x81 },                /* presence   */
+        { C1001_CON_FALL,   C1001_CMD_TRACK },     /* track x/y  */
+        { C1001_CON_FALL,   0x81 },                /* fall state */
+        { C1001_CON_FALL,   C1001_CMD_TRACK },     /* track x/y  */
     };
     int q_idx = 0;
     int64_t next_query_us = 0;
+    int64_t next_mwj_us = 0;
+
+    if (s_state.type == MMWAVE_TYPE_C1001) {
+        /* Restore the operator's last mode choice (default: fall). */
+        nvs_handle_t h;
+        uint8_t saved = MMWAVE_C1001_MODE_FALL;
+        if (nvs_open("csi_cfg", NVS_READONLY, &h) == ESP_OK) {
+            nvs_get_u8(h, "mw_mode", &saved);
+            nvs_close(h);
+        }
+        c1001_apply_mode(saved, false);
+    }
 
     while (s_running) {
+        if (s_state.type == MMWAVE_TYPE_C1001 && s_c1001_mode_req != 0xFF) {
+            uint8_t m = s_c1001_mode_req;
+            s_c1001_mode_req = 0xFF;
+            if (m != s_c1001_mode) {
+                c1001_apply_mode(m, true);
+                q_idx = 0;
+            }
+        }
         if (s_state.type == MMWAVE_TYPE_C1001
             && esp_timer_get_time() >= next_query_us) {
-            c1001_send_query(c1001_queries[q_idx][0], c1001_queries[q_idx][1]);
-            q_idx = (q_idx + 1) % 5;
-            next_query_us = esp_timer_get_time() + 200 * 1000;
+            bool fall = s_c1001_mode == MMWAVE_C1001_MODE_FALL;
+            const uint8_t (*q)[2] = fall ? q_fall : q_vitals;
+            int n = fall ? (int)(sizeof(q_fall) / sizeof(q_fall[0]))
+                         : (int)(sizeof(q_vitals) / sizeof(q_vitals[0]));
+            q_idx %= n;
+            c1001_send_query(q[q_idx][0], q[q_idx][1]);
+            q_idx = (q_idx + 1) % n;
+            next_query_us = esp_timer_get_time() + 150 * 1000;
+        }
+
+        /* MWJ console telemetry (2 Hz): one JSON line on the USB console so
+         * host tools (mmwave_radar.py TUI, herdr sidebar) see the live state
+         * without the network. Format is stable; parsers key on "MWJ {". */
+        static int64_t next_mwd_us = 0;
+        if (s_state.type == MMWAVE_TYPE_C1001 && esp_timer_get_time() >= next_mwd_us) {
+            next_mwd_us = esp_timer_get_time() + 2000 * 1000;
+            char line[C1001_DBG_N * 20 + 8];
+            int n = snprintf(line, sizeof(line), "MWD");
+            for (int i = 0; i < C1001_DBG_N; i++) {
+                int k = (s_c1001_dbg_idx + i) % C1001_DBG_N;
+                if (s_c1001_dbg[k].len == 0) continue;
+                n += snprintf(line + n, sizeof(line) - n, " %02X/%02X:%u:%02X%02X",
+                              s_c1001_dbg[k].con, s_c1001_dbg[k].cmd,
+                              (unsigned)s_c1001_dbg[k].len,
+                              s_c1001_dbg[k].d0, s_c1001_dbg[k].d1);
+            }
+            printf("%s\n", line);
+        }
+
+        if (esp_timer_get_time() >= next_mwj_us) {
+            next_mwj_us = esp_timer_get_time() + 500 * 1000;
+            mmwave_state_t mw;
+            if (mmwave_sensor_get_state(&mw)) {
+                /* Track point only while fresh (<2 s); null otherwise. */
+                char xy[40] = "\"x_cm\":null,\"y_cm\":null";
+                if (mw.track_valid && esp_timer_get_time() - mw.track_us < 2000000)
+                    snprintf(xy, sizeof(xy), "\"x_cm\":%d,\"y_cm\":%d",
+                             mw.track_x_cm, mw.track_y_cm);
+                printf("MWJ {\"type\":\"%s\",\"mode\":\"%s\",\"present\":%s,\"dist_cm\":%.0f,"
+                       "%s,\"targets\":%u,\"hr\":%.1f,\"br\":%.1f,\"fall\":%s,"
+                       "\"frames\":%lu,\"errors\":%lu}\n",
+                       mmwave_type_name(mw.type),
+                       mw.type != MMWAVE_TYPE_C1001 ? "-"
+                       : s_c1001_mode == MMWAVE_C1001_MODE_FALL ? "fall" : "vitals",
+                       mw.person_present ? "true" : "false",
+                       (double)mw.distance_cm,
+                       xy,
+                       (unsigned)mw.target_count,
+                       (double)mw.heart_rate_bpm,
+                       (double)mw.breathing_rate,
+                       mw.fall_detected ? "true" : "false",
+                       (unsigned long)mw.frame_count,
+                       (unsigned long)mw.error_count);
+            }
         }
 
 #if CONFIG_DISPLAY_STICKS3
@@ -991,15 +1169,16 @@ esp_err_t mmwave_sensor_init(int uart_tx_pin, int uart_rx_pin)
         n_pin_sets = 1;
     } else {
 #if CONFIG_DISPLAY_STICKS3
-        /* HAT header G43/G44 first (deployed C1001 wiring; console is on
-         * USB-Serial-JTAG so UART0's default pins are free), then Grove
-         * PORT.A, then the legacy devkit pins. */
-        pin_sets[0][0] = 43; pin_sets[0][1] = 44;
-        pin_sets[1][0] = 44; pin_sets[1][1] = 43;
-        pin_sets[2][0] = 9;  pin_sets[2][1] = 10;
-        pin_sets[3][0] = 10; pin_sets[3][1] = 9;
-        pin_sets[4][0] = 17; pin_sets[4][1] = 18;
-        n_pin_sets = 5;
+        /* Grove PORT.A (G9/G10) first — the node-2 C1001 wiring — then the
+         * HAT header G43/G44 (console is on USB-Serial-JTAG, so UART0's
+         * default pins are free). G17/G18 are NOT probed here: on StickS3
+         * they are the speaker's I2S pins, and a background re-probe would
+         * reconfigure them under the codec. */
+        pin_sets[0][0] = 10; pin_sets[0][1] = 9;
+        pin_sets[1][0] = 9;  pin_sets[1][1] = 10;
+        pin_sets[2][0] = 43; pin_sets[2][1] = 44;
+        pin_sets[3][0] = 44; pin_sets[3][1] = 43;
+        n_pin_sets = 4;
 #elif CONFIG_DISPLAY_S3BOX3
         /* BOX-3 dock: PMOD2 exposes GPIO43/44 (default UART), PMOD1 has
          * GPIO42/21 as the fallback pair; console is USB-Serial-JTAG so

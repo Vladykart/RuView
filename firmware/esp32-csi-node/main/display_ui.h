@@ -24,6 +24,13 @@ void display_ui_create(lv_obj_t *parent);
  */
 void display_ui_update(void);
 
+/**
+ * StickS3/BOX-3 simple UI only: power the mmWave sensor's 5 V rail at boot if
+ * the battery allows, BEFORE mmwave_sensor_init() starts talking to it.
+ * Blocks ~1.5 s while the sensor settles.
+ */
+void display_ui_sensor_power_boot(void);
+
 #ifdef __cplusplus
 }
 #endif

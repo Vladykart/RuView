@@ -1,0 +1,7 @@
+# Node 2 bench profile: StickS3 + DFRobot C1001 mmWave, sensor-only.
+# WiFi/CSI/UDP/OTA are off: the WiFi radio's power-up calibration on top of
+# the sensor's 5 V boost browns this battery-powered board out. Layer it on
+# the StickS3 profile:
+#   idf.py -B build-node2 -D IDF_TARGET=esp32s3 \
+#     -D "SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.defaults.sticks3;sdkconfig.defaults.node2" build
+CONFIG_CSI_MOCK_SKIP_WIFI_CONNECT=y

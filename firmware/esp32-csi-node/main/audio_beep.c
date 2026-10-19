@@ -46,6 +46,8 @@ static volatile bool s_muted = false;
 static bool s_ready = false;
 static bool s_pa_on = false;
 /* Live status for the on-device UI (written by the beep task only). */
+static volatile bool s_alarming = false;
+static volatile bool s_fall_acked = false;
 static volatile bool s_chirping = false;
 static volatile float s_cur_ival = 0, s_cur_hz = 0;
 
@@ -100,15 +102,22 @@ static void beep_task(void *arg)
         mmwave_state_t mw;
         bool has = mmwave_sensor_get_state(&mw);
 
-        if (s_muted || !has) {
-            if (s_pa_on && now - last_sound > PA_IDLE_OFF_S) pa_set(false);
-            continue;
-        }
-        if (mw.fall_detected) {
+        /* Fall alarm: a safety signal, so it sounds even when the proximity
+         * sonar is muted. A button press acknowledges it until the sensor
+         * clears the fall state. */
+        if (has && !mw.fall_detected) s_fall_acked = false;
+        s_alarming = has && mw.fall_detected && !s_fall_acked;
+        if (s_alarming) {
             pa_set(true);
             play_tone(alarm_hi ? 1500 : 950, 140);
             alarm_hi = !alarm_hi;
             last_sound = now;
+            continue;
+        }
+
+        if (s_muted || !has) {
+            s_chirping = false;
+            if (s_pa_on && now - last_sound > PA_IDLE_OFF_S) pa_set(false);
             continue;
         }
         if (mw.person_present && mw.distance_cm > 0) {
@@ -189,9 +198,18 @@ void audio_beep_get_status(audio_beep_status_t *out)
 {
     out->ready = s_ready;
     out->muted = s_muted;
+    out->alarming = s_alarming;
     out->chirping = s_chirping && !s_muted;
     out->interval_s = s_cur_ival;
     out->tone_hz = s_cur_hz;
+}
+
+bool audio_beep_ack_alarm(void)
+{
+    if (!s_alarming) return false;
+    s_fall_acked = true;
+    ESP_LOGI(TAG, "fall alarm acknowledged");
+    return true;
 }
 
 #else /* !CONFIG_DISPLAY_STICKS3 */
@@ -203,5 +221,6 @@ void audio_beep_get_status(audio_beep_status_t *out)
 {
     *out = (audio_beep_status_t){ .muted = true };
 }
+bool audio_beep_ack_alarm(void) { return false; }
 
 #endif

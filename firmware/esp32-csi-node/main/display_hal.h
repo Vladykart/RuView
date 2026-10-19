@@ -80,6 +80,13 @@ esp_err_t display_hal_battery(uint16_t *mv_out, uint8_t *pct_out);
  */
 esp_err_t display_hal_audio_pa(bool on);
 
+/**
+ * Enable/disable the external 5 V bus (StickS3 Grove/Hat, via M5PM1).
+ *
+ * @return ESP_OK on success; ESP_ERR_* if no PMU / not supported on this board.
+ */
+esp_err_t display_hal_ext5v(bool on);
+
 #ifdef __cplusplus
 }
 #endif

@@ -20,7 +20,7 @@
  *  bus). Safe to call when audio hardware is absent — it logs and disables. */
 esp_err_t audio_beep_start(void);
 
-/** Toggle mute (long-press BOOT). Returns the new muted state. */
+/** Toggle mute (hold KEY1). Returns the new muted state. */
 bool audio_beep_toggle_mute(void);
 
 bool audio_beep_muted(void);
@@ -29,11 +29,16 @@ bool audio_beep_muted(void);
 typedef struct {
     bool  ready;        /* codec + task initialized          */
     bool  muted;
+    bool  alarming;     /* fall alarm sounding (ignores mute)*/
     bool  chirping;     /* person present, chirps being sent */
     float interval_s;   /* current chirp repeat interval     */
     float tone_hz;      /* current chirp tone                */
 } audio_beep_status_t;
 
 void audio_beep_get_status(audio_beep_status_t *out);
+
+/** Silence a sounding fall alarm until the sensor clears the fall state.
+ *  Returns true if an alarm was acknowledged. */
+bool audio_beep_ack_alarm(void);
 
 #endif /* AUDIO_BEEP_H */

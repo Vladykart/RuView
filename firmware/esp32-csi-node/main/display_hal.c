@@ -295,13 +295,21 @@ static esp_err_t sticks3_lcd_power_on(void)
     err = pm1_update_bit(0x11, 1 << 2, true);  /* GPIO2 high → LCD power  */
     ESP_LOGI(TAG, "M5PM1 LCD power rail: %s", err == ESP_OK ? "ON" : "FAILED");
 
-    /* EXT_5V bus (Grove PortA / Hat / IR) is OFF by default on the StickS3 —
-     * reg 0x06 bit3 enables it (M5Unified Power_Class). The C1001 mmWave
-     * sensor hangs off PortA and is dead without this. */
-    esp_err_t e5 = pm1_update_bit(0x06, 1 << 3, true);
-    ESP_LOGI(TAG, "M5PM1 EXT 5V bus (Grove/Hat): %s",
-             e5 == ESP_OK ? "ON" : "FAILED");
+    /* EXT_5V bus (Grove PortA / Hat / IR) powers the C1001. The PMIC keeps
+     * this bit across ESP resets, so after a brownout it may still be on and
+     * would brown the board out again before anything runs. Force it OFF
+     * here; display_ui's battery policy turns it on once VBAT can carry it. */
+    pm1_update_bit(0x06, 1 << 3, false);
+    ESP_LOGI(TAG, "M5PM1 EXT 5V bus held OFF until battery check");
     return err;
+}
+
+esp_err_t display_hal_ext5v(bool on)
+{
+    esp_err_t e = pm1_update_bit(0x06, 1 << 3, on);
+    ESP_LOGI(TAG, "M5PM1 EXT 5V bus (Grove/Hat): %s%s", on ? "ON" : "OFF",
+             e == ESP_OK ? "" : " (FAILED)");
+    return e;
 }
 
 /* Audio PA (AW8737) enable via M5PM1 GPIO3 — same push-pull sequence as the

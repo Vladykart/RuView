@@ -52,6 +52,13 @@ typedef struct {
     float    distance_cm;       /**< Distance to nearest target in cm. */
     uint8_t  target_count;      /**< Number of detected targets. */
 
+    /* Track point (C1001 fall mode): sensor-frame position, cm.
+     * x = lateral (sign = side), y = forward from the sensor. */
+    bool     track_valid;       /**< True if a recent track point exists. */
+    int16_t  track_x_cm;
+    int16_t  track_y_cm;
+    int64_t  track_us;          /**< Timestamp of the last track point. */
+
     /* Quality metrics */
     uint32_t frame_count;       /**< Total parsed frames since boot. */
     uint32_t error_count;       /**< Parse errors / CRC failures. */
@@ -88,5 +95,19 @@ const char *mmwave_type_name(mmwave_type_t type);
  * debugging of headless nodes via the OTA HTTP server).
  */
 const char *mmwave_get_diag(void);
+
+/* DFRobot C1001 work modes — mutually exclusive on the sensor. */
+#define MMWAVE_C1001_MODE_VITALS 0   /* sleep mode: breathing + heart rate */
+#define MMWAVE_C1001_MODE_FALL   1   /* fall mode: fall detection          */
+
+/** Current C1001 work mode (MMWAVE_C1001_MODE_*). */
+uint8_t mmwave_c1001_get_mode(void);
+
+/**
+ * Request a C1001 work-mode change. Applied by the UART task (which owns the
+ * port) within ~200 ms, persisted to NVS (csi_cfg/mw_mode). Values from the
+ * other mode are cleared. No-op for other sensor types.
+ */
+void mmwave_c1001_set_mode(uint8_t mode);
 
 #endif /* MMWAVE_SENSOR_H */
