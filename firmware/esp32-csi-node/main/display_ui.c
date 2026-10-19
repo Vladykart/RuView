@@ -69,7 +69,7 @@ static const char *TAG = "disp_ui";
  * by the ESP32-S3 (M5 StickS3 pinmap), active-LOW with the board pull-ups.
  * Polled in the display task (no ISR), debounced.
  *   KEY1 short: next page          KEY1 hold: volume LOW>MID>HIGH>OFF
- *   KEY2 short: radar zoom 6/3 m   KEY2 hold: C1001 mode FALL <-> VITALS
+ *   KEY2 short: radar zoom 6/3 m   KEY2 hold: mode AUTO > FALL > VITALS
  *   any key while a fall alarm sounds: acknowledge it
  *   both keys held 2 s: force sensor power on (battery-policy override) ---- */
 #define UI_KEY1_GPIO       GPIO_NUM_11
@@ -570,10 +570,17 @@ static void ui_key_long(int k, uint32_t now_ms)
                                              "VOLUME MID", "VOLUME HIGH" };
         ui_banner(names[audio_beep_cycle_volume()], now_ms);
     } else {
-        uint8_t next = mmwave_c1001_get_mode() == MMWAVE_C1001_MODE_FALL
-                       ? MMWAVE_C1001_MODE_VITALS : MMWAVE_C1001_MODE_FALL;
-        mmwave_c1001_set_mode(next);
-        ui_banner(next == MMWAVE_C1001_MODE_FALL ? "MODE: FALL" : "MODE: VITALS", now_ms);
+        /* AUTO -> FALL -> VITALS -> AUTO */
+        static const uint8_t next_of[] = {
+            [MMWAVE_C1001_POLICY_VITALS] = MMWAVE_C1001_POLICY_AUTO,
+            [MMWAVE_C1001_POLICY_FALL]   = MMWAVE_C1001_POLICY_VITALS,
+            [MMWAVE_C1001_POLICY_AUTO]   = MMWAVE_C1001_POLICY_FALL,
+        };
+        uint8_t next = next_of[mmwave_c1001_get_policy()];
+        mmwave_c1001_set_policy(next);
+        ui_banner(next == MMWAVE_C1001_POLICY_AUTO ? "MODE: AUTO"
+                  : next == MMWAVE_C1001_POLICY_FALL ? "MODE: FALL" : "MODE: VITALS",
+                  now_ms);
     }
 }
 
@@ -656,8 +663,9 @@ static void ui_radar_data(void)
     audio_beep_status_t snd;
     audio_beep_get_status(&snd);
 
-    snprintf(buf, sizeof(buf), "n%d %s%s", g_nvs_config.node_id,
-             fall_mode ? "FALL" : "VITALS",
+    bool autop = mmwave_c1001_get_policy() == MMWAVE_C1001_POLICY_AUTO;
+    snprintf(buf, sizeof(buf), "n%d %s%s%s", g_nvs_config.node_id,
+             autop ? "A:" : "", fall_mode ? "FALL" : "VIT",
              snd.muted ? " " LV_SYMBOL_MUTE : "");
     lv_label_set_text(s_rad_title, buf);
 
@@ -749,7 +757,7 @@ static void ui_radar_data(void)
             lv_label_set_text(s_rad_vitals, buf);
             lv_obj_set_style_text_color(s_rad_vitals, COLOR_CYAN, 0);
         } else {
-            lv_label_set_text(s_rad_vitals, fall_mode ? "no track point" : "BR --  HR --");
+            lv_label_set_text(s_rad_vitals, fall_mode ? "no track point" : "BR/HR: hold still");
             lv_obj_set_style_text_color(s_rad_vitals, COLOR_TEXT_DIM, 0);
         }
     }

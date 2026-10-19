@@ -55,9 +55,20 @@ typedef struct {
     /* Track point (C1001 fall mode): sensor-frame position, cm.
      * x = lateral (sign = side), y = forward from the sensor. */
     bool     track_valid;       /**< True if a recent track point exists. */
-    int16_t  track_x_cm;
+    int16_t  track_x_cm;        /**< Filtered (alpha-beta) position.      */
     int16_t  track_y_cm;
     int64_t  track_us;          /**< Timestamp of the last track point. */
+
+    /* C1001 motion: 0 none, 1 static (present, still), 2 active; 0xFF = n/a */
+    uint8_t  motion;
+
+    /* C1001 fall-mode installation geometry as stored in the sensor (read
+     * back on entering fall mode). Track x/y are computed from these, so a
+     * mismatch with the real mounting skews the map. */
+    bool     geom_valid;
+    int16_t  install_angle_x, install_angle_y, install_angle_z;  /* degrees */
+    uint16_t install_height_cm;
+    uint16_t auto_height_cm;    /**< Sensor's own height measurement. */
 
     /* Quality metrics */
     uint32_t frame_count;       /**< Total parsed frames since boot. */
@@ -96,18 +107,27 @@ const char *mmwave_type_name(mmwave_type_t type);
  */
 const char *mmwave_get_diag(void);
 
-/* DFRobot C1001 work modes — mutually exclusive on the sensor. */
+/* DFRobot C1001 work modes — mutually exclusive on the sensor (its DSP runs
+ * one pipeline at a time). */
 #define MMWAVE_C1001_MODE_VITALS 0   /* sleep mode: breathing + heart rate */
-#define MMWAVE_C1001_MODE_FALL   1   /* fall mode: fall detection          */
+#define MMWAVE_C1001_MODE_FALL   1   /* fall mode: track + fall detection  */
 
-/** Current C1001 work mode (MMWAVE_C1001_MODE_*). */
+/* Mode policy: a fixed mode, or AUTO = FALL while the person moves, VITALS
+ * once they have been still for a while (see mmwave_sensor.c). */
+#define MMWAVE_C1001_POLICY_VITALS MMWAVE_C1001_MODE_VITALS
+#define MMWAVE_C1001_POLICY_FALL   MMWAVE_C1001_MODE_FALL
+#define MMWAVE_C1001_POLICY_AUTO   2
+
+/** Work mode the sensor is in right now (MMWAVE_C1001_MODE_*). */
 uint8_t mmwave_c1001_get_mode(void);
 
+/** Selected policy (MMWAVE_C1001_POLICY_*). */
+uint8_t mmwave_c1001_get_policy(void);
+
 /**
- * Request a C1001 work-mode change. Applied by the UART task (which owns the
- * port) within ~200 ms, persisted to NVS (csi_cfg/mw_mode). Values from the
- * other mode are cleared. No-op for other sensor types.
+ * Select a mode policy. Applied by the UART task (which owns the port) within
+ * ~150 ms and persisted to NVS (csi_cfg/mw_mode). No-op for other sensors.
  */
-void mmwave_c1001_set_mode(uint8_t mode);
+void mmwave_c1001_set_policy(uint8_t policy);
 
 #endif /* MMWAVE_SENSOR_H */

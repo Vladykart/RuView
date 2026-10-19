@@ -84,6 +84,8 @@ static const char *TAG = "mmwave";
 #define C1001_CON_FALL      0x83  /* cmd 0x81 fall state */
 #define C1001_CON_HEART     0x85  /* cmd 0x82 heart rate */
 #define C1001_CON_MODE      0x02  /* cmd 0xA8 set work mode: data 0x00 sleep, 0x01 fall */
+#define C1001_CON_GEOM      0x06  /* fall mode install: 0x81 angle x,y,z (deg), 0x82 height (cm) */
+#define C1001_CMD_AUTOHGT   0x90  /* con 0x83: sensor's auto-measured height (cm) */
 #define C1001_CMD_DISTANCE  0x84  /* sleep mode: target distance, 2B BE cm        */
 #define C1001_CMD_SEAT_DIST 0x8D  /* fall mode: seated detection RANGE setting (not a reading) */
 #define C1001_CMD_MOVE_DIST 0x8E  /* fall mode: motion detection RANGE setting (not a reading) */
@@ -97,18 +99,32 @@ static const char *TAG = "mmwave";
 static mmwave_state_t s_state;
 static volatile bool s_running;
 
-/* C1001 work mode: current, and a pending request from another task (the
- * UART task owns the port, so it applies the change). 0xFF = none pending. */
+/* C1001 work mode (what the sensor runs now), the operator's policy, and a
+ * pending policy request from another task (the UART task owns the port, so
+ * it applies changes). 0xFF = none pending. */
 static volatile uint8_t s_c1001_mode = MMWAVE_C1001_MODE_FALL;
-static volatile uint8_t s_c1001_mode_req = 0xFF;
+static volatile uint8_t s_c1001_policy = MMWAVE_C1001_POLICY_AUTO;
+static volatile uint8_t s_c1001_policy_req = 0xFF;
 
 uint8_t mmwave_c1001_get_mode(void) { return s_c1001_mode; }
+uint8_t mmwave_c1001_get_policy(void) { return s_c1001_policy; }
 
-void mmwave_c1001_set_mode(uint8_t mode)
+void mmwave_c1001_set_policy(uint8_t policy)
 {
-    if (mode != MMWAVE_C1001_MODE_VITALS && mode != MMWAVE_C1001_MODE_FALL) return;
-    s_c1001_mode_req = mode;
+    if (policy > MMWAVE_C1001_POLICY_AUTO) return;
+    s_c1001_policy_req = policy;
 }
+
+/* Track filter: alpha-beta on the raw track point (cm, sensor frame). Smooths
+ * jitter, rejects jumps beyond the gate, coasts through zero readings. */
+#define TRK_ALPHA       0.55f
+#define TRK_BETA        0.15f
+#define TRK_GATE_CM     120.0f
+#define TRK_VMAX_CMS    300.0f
+static float   s_fx, s_fy, s_fvx, s_fvy;
+static int64_t s_f_us;
+static bool    s_f_init;
+static int     s_f_rejects;
 
 /* Diagnostic transcript kept in RAM so headless nodes can serve it
  * remotely (GET /ota/diag). */
@@ -415,7 +431,7 @@ static void c1001_send_query(uint8_t con, uint8_t cmd)
 /* Switch the C1001 work mode (UART task only). Values that only the other
  * mode produces are cleared so the UI never shows stale vitals or a stale
  * fall. Sent a few times since the sensor may be busy. */
-static void c1001_apply_mode(uint8_t mode, bool save)
+static void c1001_apply_mode(uint8_t mode, const char *why)
 {
     for (int i = 0; i < 3; i++) {
         c1001_send(C1001_CON_MODE, C1001_CMD_SETMODE, mode);
@@ -424,24 +440,28 @@ static void c1001_apply_mode(uint8_t mode, bool save)
     s_c1001_mode = mode;
     s_state.distance_cm = 0;
     s_state.track_valid = false;
+    s_state.motion = 0xFF;
+    s_f_init = false;
     if (mode == MMWAVE_C1001_MODE_FALL) {
         s_state.breathing_rate = 0;
         s_state.heart_rate_bpm = 0;
     } else {
         s_state.fall_detected = false;
     }
-    if (save) {
-        nvs_handle_t h;
-        if (nvs_open("csi_cfg", NVS_READWRITE, &h) == ESP_OK) {
-            nvs_set_u8(h, "mw_mode", mode);
-            nvs_commit(h);
-            nvs_close(h);
-        }
-    }
-    ESP_LOGI(TAG, "C1001 work mode set: %s%s",
-             mode == MMWAVE_C1001_MODE_FALL ? "FALL (presence+distance+fall)"
+    ESP_LOGI(TAG, "C1001 work mode -> %s (%s)",
+             mode == MMWAVE_C1001_MODE_FALL ? "FALL (presence+track+fall)"
                                             : "VITALS (presence+distance+breathing+heart)",
-             save ? " (saved)" : "");
+             why);
+}
+
+static void c1001_save_policy(uint8_t policy)
+{
+    nvs_handle_t h;
+    if (nvs_open("csi_cfg", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, "mw_mode", policy);
+        nvs_commit(h);
+        nvs_close(h);
+    }
 }
 #endif
 
@@ -474,7 +494,29 @@ static void c1001_process_frame(uint8_t con, uint8_t cmd,
         s_state.person_present = (data[0] != 0);
         s_state.target_count = (data[0] != 0) ? 1 : 0;
     } else if (con == C1001_CON_STATUS && cmd == 0x82) {
-        /* Motion: 0=none, 1=static, 2=active — presence handled above. */
+        /* Motion: 0=none, 1=static, 2=active — drives the AUTO policy. */
+        if (data[0] <= 2) s_state.motion = data[0];
+    } else if (con == C1001_CON_GEOM && cmd == 0x81 && len >= 6) {
+        int16_t ax = (int16_t)((data[0] << 8) | data[1]);
+        int16_t ay = (int16_t)((data[2] << 8) | data[3]);
+        int16_t az = (int16_t)((data[4] << 8) | data[5]);
+        if (!s_state.geom_valid || ax != s_state.install_angle_x ||
+            ay != s_state.install_angle_y || az != s_state.install_angle_z)
+            ESP_LOGI(TAG, "C1001 install angle x=%d y=%d z=%d deg", ax, ay, az);
+        s_state.install_angle_x = ax;
+        s_state.install_angle_y = ay;
+        s_state.install_angle_z = az;
+    } else if (con == C1001_CON_GEOM && cmd == 0x82 && len >= 2) {
+        uint16_t h = (data[0] << 8) | data[1];
+        if (!s_state.geom_valid || h != s_state.install_height_cm)
+            ESP_LOGI(TAG, "C1001 install height %u cm", h);
+        s_state.install_height_cm = h;
+        s_state.geom_valid = true;
+    } else if (con == C1001_CON_FALL && cmd == 0x90 && len >= 2) {
+        uint16_t h = (data[0] << 8) | data[1];
+        if (h != s_state.auto_height_cm)
+            ESP_LOGI(TAG, "C1001 auto-measured height %u cm", h);
+        s_state.auto_height_cm = h;
     } else if (con == C1001_CON_STATUS && cmd == C1001_CMD_DISTANCE) {
         /* Sleep mode target distance: 2 bytes big-endian, cm. */
         if (len >= 2) s_state.distance_cm = (float)(((uint16_t)data[0] << 8) | data[1]);
@@ -490,13 +532,41 @@ static void c1001_process_frame(uint8_t con, uint8_t cmd,
         if (len >= 4) {
             int16_t x = (int16_t)(((uint16_t)data[0] << 8) | data[1]);
             int16_t y = (int16_t)(((uint16_t)data[2] << 8) | data[3]);
-            s_state.track_x_cm = x;
-            s_state.track_y_cm = y;
-            s_state.track_valid = (x != 0 || y != 0);
-            s_state.track_us = esp_timer_get_time();
+            if (x == 0 && y == 0) return;   /* no target: coast; consumers age it out */
+            int64_t now = esp_timer_get_time();
+            if (!s_f_init || now - s_f_us > 2000000) {
+                s_fx = x; s_fy = y; s_fvx = s_fvy = 0;
+                s_f_init = true;
+                s_f_rejects = 0;
+            } else {
+                float dt = (now - s_f_us) / 1e6f;
+                float px = s_fx + s_fvx * dt, py = s_fy + s_fvy * dt;
+                float rx = x - px, ry = y - py;
+                if (sqrtf(rx * rx + ry * ry) > TRK_GATE_CM && ++s_f_rejects < 3)
+                    return;                  /* outlier: keep the estimate */
+                if (s_f_rejects >= 3) {      /* persistent jump: re-acquire */
+                    s_fx = x; s_fy = y; s_fvx = s_fvy = 0;
+                } else {
+                    s_fx = px + TRK_ALPHA * rx;
+                    s_fy = py + TRK_ALPHA * ry;
+                    if (dt > 0.02f) {
+                        s_fvx += TRK_BETA * rx / dt;
+                        s_fvy += TRK_BETA * ry / dt;
+                    }
+                    if (s_fvx >  TRK_VMAX_CMS) s_fvx =  TRK_VMAX_CMS;
+                    if (s_fvx < -TRK_VMAX_CMS) s_fvx = -TRK_VMAX_CMS;
+                    if (s_fvy >  TRK_VMAX_CMS) s_fvy =  TRK_VMAX_CMS;
+                    if (s_fvy < -TRK_VMAX_CMS) s_fvy = -TRK_VMAX_CMS;
+                }
+                s_f_rejects = 0;
+            }
+            s_f_us = now;
+            s_state.track_x_cm = (int16_t)lroundf(s_fx);
+            s_state.track_y_cm = (int16_t)lroundf(s_fy);
+            s_state.track_valid = true;
+            s_state.track_us = now;
             /* In fall mode the track point is the only measured position. */
-            s_state.distance_cm = s_state.track_valid
-                ? sqrtf((float)x * x + (float)y * y) : 0.0f;
+            s_state.distance_cm = sqrtf(s_fx * s_fx + s_fy * s_fy);
         }
     }
 }
@@ -748,60 +818,140 @@ static void mmwave_uart_task(void *arg)
              mmwave_type_name(s_state.type));
 
     uint8_t buf[128];
-    /* C1001 is query/response: round-robin one query per 200 ms. Its two work
+    /* C1001 is query/response: round-robin one query per 120 ms. Its two work
      * modes expose different data (DFRobot_HumanDetection: smHumanData vs
-     * dmHumanData/getFallData), so each mode has its own query table. */
+     * dmHumanData/getFallData), so each mode has its own query table. Motion
+     * (0x80/0x82) is in both: it drives the AUTO policy. */
     static const uint8_t q_vitals[][2] = {
         { C1001_CON_STATUS, 0x81 },                /* presence  */
         { C1001_CON_STATUS, C1001_CMD_DISTANCE },  /* distance  */
+        { C1001_CON_STATUS, 0x82 },                /* motion    */
         { C1001_CON_BREATH, 0x82 },                /* breathing */
         { C1001_CON_HEART,  0x82 },                /* heart     */
     };
-    /* Fall mode: the track point is the position (and so the distance);
-     * queried every other slot (~3 Hz at 150 ms). Fall state twice per cycle
-     * so an alarm is never more than ~0.6 s late. NOTE: 0x80/0x8D and
+    /* Fall mode: the track point is the position (and so the distance),
+     * every other slot (~4 Hz). Fall state every 0.7 s. NOTE: 0x80/0x8D and
      * 0x80/0x8E are the configured seated/motion detection RANGES, not a
      * measured distance — they read 200/300 cm with nobody present. */
     static const uint8_t q_fall[][2] = {
         { C1001_CON_STATUS, 0x81 },                /* presence   */
         { C1001_CON_FALL,   C1001_CMD_TRACK },     /* track x/y  */
+        { C1001_CON_STATUS, 0x82 },                /* motion     */
+        { C1001_CON_FALL,   C1001_CMD_TRACK },     /* track x/y  */
         { C1001_CON_FALL,   0x81 },                /* fall state */
         { C1001_CON_FALL,   C1001_CMD_TRACK },     /* track x/y  */
     };
-    int q_idx = 0;
-    int64_t next_query_us = 0;
+    /* One-shot queries (installation geometry), sent ahead of the table. */
+    static const uint8_t q_geom[][2] = {
+        { C1001_CON_GEOM, 0x81 },                  /* install angle  */
+        { C1001_CON_GEOM, 0x82 },                  /* install height */
+        { C1001_CON_FALL, C1001_CMD_AUTOHGT },     /* auto height    */
+    };
+    int q_idx = 0, geom_left = 0;
+    int64_t next_query_us = 0, next_geom_us = 0;
     int64_t next_mwj_us = 0;
 
+    /* AUTO policy timing (see the state machine below). */
+    const int64_t AUTO_STILL_US  = 20 * 1000000LL;  /* still this long -> VITALS */
+    const int64_t AUTO_ACTIVE_US =  1 * 1000000LL;  /* active this long -> FALL  */
+    const int64_t AUTO_ABSENT_US = 10 * 1000000LL;  /* gone this long  -> FALL  */
+    const int64_t AUTO_DWELL_US  = 15 * 1000000LL;  /* min time in VITALS... */
+    const int64_t AUTO_DWELL_BACK_US = 4 * 1000000LL; /* ...before motion wins */
+    int64_t mode_since = 0, still_since = 0, active_since = 0, absent_since = 0;
+
     if (s_state.type == MMWAVE_TYPE_C1001) {
-        /* Restore the operator's last mode choice (default: fall). */
+        /* Restore the operator's policy (default AUTO). Values 0/1 saved by
+         * earlier builds are fixed modes and keep their meaning. */
         nvs_handle_t h;
-        uint8_t saved = MMWAVE_C1001_MODE_FALL;
+        uint8_t saved = MMWAVE_C1001_POLICY_AUTO;
         if (nvs_open("csi_cfg", NVS_READONLY, &h) == ESP_OK) {
             nvs_get_u8(h, "mw_mode", &saved);
             nvs_close(h);
         }
-        c1001_apply_mode(saved, false);
+        s_c1001_policy = saved <= MMWAVE_C1001_POLICY_AUTO ? saved
+                                                           : MMWAVE_C1001_POLICY_AUTO;
+        uint8_t m = s_c1001_policy == MMWAVE_C1001_POLICY_AUTO
+                    ? MMWAVE_C1001_MODE_FALL : s_c1001_policy;
+        c1001_apply_mode(m, "boot");
+        mode_since = esp_timer_get_time();
+        if (m == MMWAVE_C1001_MODE_FALL) geom_left = 3;
     }
 
     while (s_running) {
-        if (s_state.type == MMWAVE_TYPE_C1001 && s_c1001_mode_req != 0xFF) {
-            uint8_t m = s_c1001_mode_req;
-            s_c1001_mode_req = 0xFF;
-            if (m != s_c1001_mode) {
-                c1001_apply_mode(m, true);
+        int64_t now = esp_timer_get_time();
+        if (s_state.type == MMWAVE_TYPE_C1001 && s_c1001_policy_req != 0xFF) {
+            uint8_t pol = s_c1001_policy_req;
+            s_c1001_policy_req = 0xFF;
+            s_c1001_policy = pol;
+            c1001_save_policy(pol);
+            ESP_LOGI(TAG, "C1001 policy -> %s (saved)",
+                     pol == MMWAVE_C1001_POLICY_AUTO ? "AUTO"
+                     : pol == MMWAVE_C1001_POLICY_FALL ? "FALL" : "VITALS");
+            uint8_t want = pol == MMWAVE_C1001_POLICY_AUTO ? MMWAVE_C1001_MODE_FALL : pol;
+            if (want != s_c1001_mode) {
+                c1001_apply_mode(want, "operator");
+                mode_since = now = esp_timer_get_time();
                 q_idx = 0;
+                if (want == MMWAVE_C1001_MODE_FALL) geom_left = 3;
+            }
+            still_since = active_since = absent_since = 0;
+        }
+
+        /* AUTO: FALL while the person moves (that is when falls happen, and
+         * it gives the position track); VITALS once they have been still long
+         * enough to measure breathing/heart; back to FALL as soon as real
+         * motion starts or the room is empty. Never leaves FALL while a fall
+         * is reported, so the alarm is not cut off; after the fall clears and
+         * the person lies still, VITALS confirms they are breathing. */
+        if (s_state.type == MMWAVE_TYPE_C1001 &&
+            s_c1001_policy == MMWAVE_C1001_POLICY_AUTO) {
+            bool present = s_state.person_present;
+            uint8_t mo = s_state.motion;
+            if (present && mo <= 1) { if (!still_since) still_since = now; } else still_since = 0;
+            if (present && mo == 2) { if (!active_since) active_since = now; } else active_since = 0;
+            if (!present) { if (!absent_since) absent_since = now; } else absent_since = 0;
+            int64_t in_mode = now - mode_since;
+            const char *why = NULL;
+            uint8_t next = s_c1001_mode;
+            if (s_c1001_mode == MMWAVE_C1001_MODE_FALL) {
+                if (!s_state.fall_detected && in_mode > AUTO_DWELL_BACK_US &&
+                    still_since && now - still_since > AUTO_STILL_US) {
+                    next = MMWAVE_C1001_MODE_VITALS; why = "auto: still";
+                }
+            } else if (in_mode > AUTO_DWELL_BACK_US) {
+                if (active_since && now - active_since >= AUTO_ACTIVE_US) {
+                    next = MMWAVE_C1001_MODE_FALL; why = "auto: moving";
+                } else if (absent_since && now - absent_since > AUTO_ABSENT_US &&
+                           in_mode > AUTO_DWELL_US) {
+                    next = MMWAVE_C1001_MODE_FALL; why = "auto: room empty";
+                }
+            }
+            if (why) {
+                c1001_apply_mode(next, why);
+                mode_since = now = esp_timer_get_time();
+                q_idx = 0;
+                still_since = active_since = absent_since = 0;
+                if (next == MMWAVE_C1001_MODE_FALL) geom_left = 3;
             }
         }
-        if (s_state.type == MMWAVE_TYPE_C1001
-            && esp_timer_get_time() >= next_query_us) {
+
+        if (s_state.type == MMWAVE_TYPE_C1001 && now >= next_query_us) {
             bool fall = s_c1001_mode == MMWAVE_C1001_MODE_FALL;
-            const uint8_t (*q)[2] = fall ? q_fall : q_vitals;
-            int n = fall ? (int)(sizeof(q_fall) / sizeof(q_fall[0]))
-                         : (int)(sizeof(q_vitals) / sizeof(q_vitals[0]));
-            q_idx %= n;
-            c1001_send_query(q[q_idx][0], q[q_idx][1]);
-            q_idx = (q_idx + 1) % n;
-            next_query_us = esp_timer_get_time() + 150 * 1000;
+            if (fall && geom_left == 0 && now >= next_geom_us) geom_left = 3;
+            if (fall && geom_left > 0) {
+                /* Installation geometry: on entering fall mode, then each 60 s. */
+                const uint8_t *g = q_geom[3 - geom_left];
+                c1001_send_query(g[0], g[1]);
+                if (--geom_left == 0) next_geom_us = now + 60 * 1000000LL;
+            } else {
+                const uint8_t (*q)[2] = fall ? q_fall : q_vitals;
+                int n = fall ? (int)(sizeof(q_fall) / sizeof(q_fall[0]))
+                             : (int)(sizeof(q_vitals) / sizeof(q_vitals[0]));
+                q_idx %= n;
+                c1001_send_query(q[q_idx][0], q[q_idx][1]);
+                q_idx = (q_idx + 1) % n;
+            }
+            next_query_us = now + 120 * 1000;
         }
 
         /* MWJ console telemetry (2 Hz): one JSON line on the USB console so
@@ -832,12 +982,24 @@ static void mmwave_uart_task(void *arg)
                 if (mw.track_valid && esp_timer_get_time() - mw.track_us < 2000000)
                     snprintf(xy, sizeof(xy), "\"x_cm\":%d,\"y_cm\":%d",
                              mw.track_x_cm, mw.track_y_cm);
-                printf("MWJ {\"type\":\"%s\",\"mode\":\"%s\",\"present\":%s,\"dist_cm\":%.0f,"
+                char geo[64] = "";
+                if (mw.geom_valid)
+                    snprintf(geo, sizeof(geo),
+                             ",\"inst_h\":%u,\"auto_h\":%u,\"ang\":[%d,%d,%d]",
+                             mw.install_height_cm, mw.auto_height_cm,
+                             mw.install_angle_x, mw.install_angle_y,
+                             mw.install_angle_z);
+                printf("MWJ {\"type\":\"%s\",\"mode\":\"%s\",\"policy\":\"%s\","
+                       "\"motion\":%d,\"present\":%s,\"dist_cm\":%.0f,"
                        "%s,\"targets\":%u,\"hr\":%.1f,\"br\":%.1f,\"fall\":%s,"
-                       "\"frames\":%lu,\"errors\":%lu}\n",
+                       "\"frames\":%lu,\"errors\":%lu%s}\n",
                        mmwave_type_name(mw.type),
                        mw.type != MMWAVE_TYPE_C1001 ? "-"
                        : s_c1001_mode == MMWAVE_C1001_MODE_FALL ? "fall" : "vitals",
+                       mw.type != MMWAVE_TYPE_C1001 ? "-"
+                       : s_c1001_policy == MMWAVE_C1001_POLICY_AUTO ? "auto"
+                       : s_c1001_policy == MMWAVE_C1001_POLICY_FALL ? "fall" : "vitals",
+                       mw.motion == 0xFF ? -1 : (int)mw.motion,
                        mw.person_present ? "true" : "false",
                        (double)mw.distance_cm,
                        xy,
@@ -846,7 +1008,7 @@ static void mmwave_uart_task(void *arg)
                        (double)mw.breathing_rate,
                        mw.fall_detected ? "true" : "false",
                        (unsigned long)mw.frame_count,
-                       (unsigned long)mw.error_count);
+                       (unsigned long)mw.error_count, geo);
             }
         }
 

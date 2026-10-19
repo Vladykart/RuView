@@ -8,6 +8,8 @@
  */
 
 #include <string.h>
+#include <stdio.h>
+#include <unistd.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -140,6 +142,47 @@ static void wifi_init_sta(void)
     }
 }
 
+/* ---- MWC console commands (USB-Serial-JTAG stdin) ----
+ * One line per command, e.g. "MWC policy vitals". Lets host tools (the herdr
+ * radar) and remote debugging drive the node without touching its keys.
+ * The default console VFS reads non-blocking and drops output when no host
+ * is attached, so polling here never stalls a battery-only node. */
+static void mwc_handle(const char *l)
+{
+    if (strncmp(l, "MWC ", 4) != 0) return;
+    const char *c = l + 4;
+    bool ok = true;
+    if (!strcmp(c, "policy auto"))        mmwave_c1001_set_policy(MMWAVE_C1001_POLICY_AUTO);
+    else if (!strcmp(c, "policy fall"))   mmwave_c1001_set_policy(MMWAVE_C1001_POLICY_FALL);
+    else if (!strcmp(c, "policy vitals")) mmwave_c1001_set_policy(MMWAVE_C1001_POLICY_VITALS);
+#if CONFIG_DISPLAY_STICKS3
+    else if (!strcmp(c, "volume next"))   audio_beep_cycle_volume();
+#endif
+    else ok = false;
+    printf("MWC %s %s\n", ok ? "ok" : "unknown", c);
+}
+
+static void mwc_task(void *arg)
+{
+    (void)arg;
+    char line[48];
+    int n = 0;
+    for (;;) {
+        char ch;
+        if (read(STDIN_FILENO, &ch, 1) != 1) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+        if (ch == '\r' || ch == '\n') {
+            line[n] = '\0';
+            if (n) mwc_handle(line);
+            n = 0;
+        } else if (n < (int)sizeof(line) - 1) {
+            line[n++] = ch;
+        }
+    }
+}
+
 void app_main(void)
 {
     /* Initialize NVS */
@@ -182,6 +225,7 @@ void app_main(void)
     } else {
         ESP_LOGI(TAG, "No mmWave sensor detected (CSI-only mode)");
     }
+    xTaskCreate(mwc_task, "mwc", 3072, NULL, 2, NULL);
 
     /* StickS3 proximity sonar + fall alarm, keyed to the C1001 state. Start it
      * even when no sensor answered yet: the sensor is powered later by the
