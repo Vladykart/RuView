@@ -68,7 +68,7 @@ static const char *TAG = "disp_ui";
 /* ---- Buttons: StickS3 KEY1 = G11 (front), KEY2 = G12 (side), read directly
  * by the ESP32-S3 (M5 StickS3 pinmap), active-LOW with the board pull-ups.
  * Polled in the display task (no ISR), debounced.
- *   KEY1 short: next page          KEY1 hold: mute / unmute sonar
+ *   KEY1 short: next page          KEY1 hold: volume LOW>MID>HIGH>OFF
  *   KEY2 short: radar zoom 6/3 m   KEY2 hold: C1001 mode FALL <-> VITALS
  *   any key while a fall alarm sounds: acknowledge it
  *   both keys held 2 s: force sensor power on (battery-policy override) ---- */
@@ -273,7 +273,7 @@ static void create_radar_page(lv_obj_t *pg)
 
     /* Controls legend, two lines (135 px is too narrow for one) */
     mk_text(pg, 0, SCR_H - 32, SCR_W, &lv_font_montserrat_12, COLOR_TEXT_DIM,
-            LV_TEXT_ALIGN_CENTER, "K1 page | hold mute");
+            LV_TEXT_ALIGN_CENTER, "K1 page | hold vol");
     mk_text(pg, 0, SCR_H - 17, SCR_W, &lv_font_montserrat_12, COLOR_TEXT_DIM,
             LV_TEXT_ALIGN_CENTER, "K2 zoom | hold mode");
 }
@@ -566,8 +566,9 @@ static void ui_key_short(int k, uint32_t now_ms)
 static void ui_key_long(int k, uint32_t now_ms)
 {
     if (k == 0) {
-        bool muted = audio_beep_toggle_mute();
-        ui_banner(muted ? "SONAR MUTED" : "SONAR ON", now_ms);
+        static const char *const names[] = { "VOLUME OFF", "VOLUME LOW",
+                                             "VOLUME MID", "VOLUME HIGH" };
+        ui_banner(names[audio_beep_cycle_volume()], now_ms);
     } else {
         uint8_t next = mmwave_c1001_get_mode() == MMWAVE_C1001_MODE_FALL
                        ? MMWAVE_C1001_MODE_VITALS : MMWAVE_C1001_MODE_FALL;
@@ -763,6 +764,7 @@ static void ui_radar_data(void)
     }
 
     /* ---- sonar line ---- */
+    static const char *const vol_names[] = { "OFF", "LOW", "MID", "HIGH" };
     if (snd.alarming) {
         lv_label_set_text(s_rad_sound, LV_SYMBOL_WARNING " FALL ALARM: press key");
         lv_obj_set_style_text_color(s_rad_sound, COLOR_RED, 0);
@@ -770,15 +772,18 @@ static void ui_radar_data(void)
         lv_label_set_text(s_rad_sound, LV_SYMBOL_MUTE " no audio");
         lv_obj_set_style_text_color(s_rad_sound, COLOR_TEXT_DIM, 0);
     } else if (snd.muted) {
-        lv_label_set_text(s_rad_sound, LV_SYMBOL_MUTE " sonar muted");
+        lv_label_set_text(s_rad_sound, LV_SYMBOL_MUTE " sonar off (hold K1)");
         lv_obj_set_style_text_color(s_rad_sound, COLOR_AMBER, 0);
     } else if (snd.chirping) {
-        snprintf(buf, sizeof(buf), LV_SYMBOL_VOLUME_MAX " %.2fs @ %.1fkHz",
-                 (double)snd.interval_s, (double)(snd.tone_hz / 1000.0f));
+        snprintf(buf, sizeof(buf), LV_SYMBOL_VOLUME_MAX " %s %.2fs %.1fk",
+                 vol_names[snd.volume], (double)snd.interval_s,
+                 (double)(snd.tone_hz / 1000.0f));
         lv_label_set_text(s_rad_sound, buf);
         lv_obj_set_style_text_color(s_rad_sound, COLOR_CYAN, 0);
     } else {
-        lv_label_set_text(s_rad_sound, LV_SYMBOL_VOLUME_MID " sonar armed");
+        snprintf(buf, sizeof(buf), LV_SYMBOL_VOLUME_MID " sonar %s armed",
+                 vol_names[snd.volume]);
+        lv_label_set_text(s_rad_sound, buf);
         lv_obj_set_style_text_color(s_rad_sound, COLOR_TEXT_DIM, 0);
     }
 }

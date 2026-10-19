@@ -18,6 +18,7 @@
 #include "driver/i2s_std.h"
 #include "driver/i2c.h"
 #include "es8311.h"
+#include "nvs.h"
 #include "display_hal.h"
 #include "mmwave_sensor.h"
 
@@ -29,7 +30,12 @@ static const char *TAG = "beep";
 #define BEEP_GPIO_BCK  17
 #define BEEP_GPIO_WS   15
 #define BEEP_GPIO_DOUT 14
-#define BEEP_VOLUME    72                 /* ES8311 0..100                  */
+#define BEEP_VOLUME    60                 /* ES8311 0..100 (was 72: too loud) */
+
+/* Per-level sample amplitude (int16 peak). Relative to the old fixed
+ * 72 + 12000: HIGH ~ -7.6 dB, MID ~ -15.5 dB, LOW ~ -26 dB. */
+static const int16_t s_level_amp[] = { 0, 1200, 4000, 10000 };
+static const char *const s_level_name[] = { "OFF", "LOW", "MID", "HIGH" };
 
 /* Chirp map: distance (m) -> repeat interval (s) and tone (Hz). */
 #define D_NEAR_M       0.3f
@@ -42,7 +48,7 @@ static const char *TAG = "beep";
 #define PA_IDLE_OFF_S  2.0f               /* amp off after this much silence */
 
 static i2s_chan_handle_t s_tx = NULL;
-static volatile bool s_muted = false;
+static volatile beep_vol_t s_vol = BEEP_VOL_LOW;   /* quiet by default */
 static bool s_ready = false;
 static bool s_pa_on = false;
 /* Live status for the on-device UI (written by the beep task only). */
@@ -58,9 +64,10 @@ static void pa_set(bool on)
     if (on) vTaskDelay(pdMS_TO_TICKS(12));   /* AW8737 settle, avoids pop */
 }
 
-/* Synthesize and play one tone burst (blocking, <= ~120 ms). */
-static void play_tone(float hz, int ms)
+/* Synthesize and play one tone burst (blocking, <= ~140 ms) at a level. */
+static void play_tone(float hz, int ms, beep_vol_t level)
 {
+    float amp = s_level_amp[level];
     enum { CHUNK = 256 };
     static int16_t buf[CHUNK];
     int total = BEEP_SR * ms / 1000;
@@ -73,7 +80,7 @@ static void play_tone(float hz, int ms)
             float env = 1.0f;
             if (k < fade) env = (float)k / fade;
             else if (total - k < fade) env = (float)(total - k) / fade;
-            buf[i] = (int16_t)(sinf(phase) * env * 12000);
+            buf[i] = (int16_t)(sinf(phase) * env * amp);
             phase += step;
         }
         size_t written = 0;
@@ -102,20 +109,21 @@ static void beep_task(void *arg)
         mmwave_state_t mw;
         bool has = mmwave_sensor_get_state(&mw);
 
-        /* Fall alarm: a safety signal, so it sounds even when the proximity
-         * sonar is muted. A button press acknowledges it until the sensor
+        /* Fall alarm: a safety signal, so it sounds even with the sonar OFF,
+         * and never below MID. A key press acknowledges it until the sensor
          * clears the fall state. */
         if (has && !mw.fall_detected) s_fall_acked = false;
         s_alarming = has && mw.fall_detected && !s_fall_acked;
         if (s_alarming) {
+            beep_vol_t lvl = s_vol > BEEP_VOL_MID ? s_vol : BEEP_VOL_MID;
             pa_set(true);
-            play_tone(alarm_hi ? 1500 : 950, 140);
+            play_tone(alarm_hi ? 1500 : 950, 140, lvl);
             alarm_hi = !alarm_hi;
             last_sound = now;
             continue;
         }
 
-        if (s_muted || !has) {
+        if (s_vol == BEEP_VOL_OFF || !has) {
             s_chirping = false;
             if (s_pa_on && now - last_sound > PA_IDLE_OFF_S) pa_set(false);
             continue;
@@ -129,7 +137,7 @@ static void beep_task(void *arg)
             s_cur_hz = hz;
             if (now - last_beep >= ival) {
                 pa_set(true);
-                play_tone(hz, CHIRP_MS);
+                play_tone(hz, CHIRP_MS, s_vol);
                 last_beep = last_sound = now;
             }
             continue;
@@ -162,6 +170,15 @@ esp_err_t audio_beep_start(void)
     }
     es8311_voice_volume_set(codec, BEEP_VOLUME, NULL);
 
+    /* Restore the operator's volume level (default LOW). */
+    nvs_handle_t h;
+    uint8_t v = BEEP_VOL_LOW;
+    if (nvs_open("csi_cfg", NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_u8(h, "beep_vol", &v);
+        nvs_close(h);
+    }
+    s_vol = v <= BEEP_VOL_HIGH ? (beep_vol_t)v : BEEP_VOL_LOW;
+
     i2s_chan_config_t ch = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     err = i2s_new_channel(&ch, &s_tx, NULL);
     if (err != ESP_OK) return err;
@@ -181,25 +198,39 @@ esp_err_t audio_beep_start(void)
     if (xTaskCreatePinnedToCore(beep_task, "beep", 4096, NULL, 3, NULL, 0)
         != pdPASS) return ESP_FAIL;
     s_ready = true;
-    ESP_LOGI(TAG, "proximity sonar ready (ES8311, I2S0, PA via PM1 G3)");
+    ESP_LOGI(TAG, "proximity sonar ready (ES8311, I2S0, PA via PM1 G3), volume %s",
+             s_level_name[s_vol]);
     return ESP_OK;
 }
 
-bool audio_beep_toggle_mute(void)
+beep_vol_t audio_beep_cycle_volume(void)
 {
-    s_muted = !s_muted;
-    ESP_LOGI(TAG, "beeper %s", s_muted ? "MUTED" : "unmuted");
-    return s_muted;
+    static const beep_vol_t next[] = {
+        [BEEP_VOL_OFF] = BEEP_VOL_LOW, [BEEP_VOL_LOW] = BEEP_VOL_MID,
+        [BEEP_VOL_MID] = BEEP_VOL_HIGH, [BEEP_VOL_HIGH] = BEEP_VOL_OFF,
+    };
+    s_vol = next[s_vol];
+    nvs_handle_t h;
+    if (nvs_open("csi_cfg", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, "beep_vol", (uint8_t)s_vol);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    ESP_LOGI(TAG, "sonar volume %s", s_level_name[s_vol]);
+    return s_vol;
 }
 
-bool audio_beep_muted(void) { return s_muted; }
+beep_vol_t audio_beep_volume(void) { return s_vol; }
+
+bool audio_beep_muted(void) { return s_vol == BEEP_VOL_OFF; }
 
 void audio_beep_get_status(audio_beep_status_t *out)
 {
     out->ready = s_ready;
-    out->muted = s_muted;
+    out->muted = s_vol == BEEP_VOL_OFF;
+    out->volume = s_vol;
     out->alarming = s_alarming;
-    out->chirping = s_chirping && !s_muted;
+    out->chirping = s_chirping && s_vol != BEEP_VOL_OFF;
     out->interval_s = s_cur_ival;
     out->tone_hz = s_cur_hz;
 }
@@ -215,11 +246,12 @@ bool audio_beep_ack_alarm(void)
 #else /* !CONFIG_DISPLAY_STICKS3 */
 
 esp_err_t audio_beep_start(void) { return ESP_ERR_NOT_SUPPORTED; }
-bool audio_beep_toggle_mute(void) { return true; }
+beep_vol_t audio_beep_cycle_volume(void) { return BEEP_VOL_OFF; }
+beep_vol_t audio_beep_volume(void) { return BEEP_VOL_OFF; }
 bool audio_beep_muted(void) { return true; }
 void audio_beep_get_status(audio_beep_status_t *out)
 {
-    *out = (audio_beep_status_t){ .muted = true };
+    *out = (audio_beep_status_t){ .muted = true, .volume = BEEP_VOL_OFF };
 }
 bool audio_beep_ack_alarm(void) { return false; }
 

@@ -20,15 +20,28 @@
  *  bus). Safe to call when audio hardware is absent — it logs and disables. */
 esp_err_t audio_beep_start(void);
 
-/** Toggle mute (hold KEY1). Returns the new muted state. */
-bool audio_beep_toggle_mute(void);
+/** Sonar volume levels. The fall alarm never plays below BEEP_VOL_MID. */
+typedef enum {
+    BEEP_VOL_OFF = 0,
+    BEEP_VOL_LOW,
+    BEEP_VOL_MID,
+    BEEP_VOL_HIGH,
+} beep_vol_t;
 
+/** Cycle LOW -> MID -> HIGH -> OFF -> LOW (hold KEY1); saved to NVS
+ *  (csi_cfg/beep_vol). Returns the new level. */
+beep_vol_t audio_beep_cycle_volume(void);
+
+beep_vol_t audio_beep_volume(void);
+
+/** True when the proximity sonar is silent (volume OFF). */
 bool audio_beep_muted(void);
 
 /** Live sonar state for the on-device UI. */
 typedef struct {
     bool  ready;        /* codec + task initialized          */
-    bool  muted;
+    bool  muted;        /* volume OFF                        */
+    beep_vol_t volume;
     bool  alarming;     /* fall alarm sounding (ignores mute)*/
     bool  chirping;     /* person present, chirps being sent */
     float interval_s;   /* current chirp repeat interval     */
